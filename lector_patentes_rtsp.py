@@ -34,23 +34,23 @@ DEFAULT_CONFIG = {
     "roi": [0.0, 0.0, 1.0, 1.0],
     "plate_polygon": [],
     "vehicle_roi": [0.0, 0.0, 1.0, 1.0],
-    "ocr_interval_seconds": 0.35,
+    "ocr_interval_seconds": 0.18,
     "always_scan": False,
     "auto_read_on_vehicle": True,
     "motion_enabled": True,
     "motion_threshold": 0.025,
     "read_after_motion_delay_seconds": 0.15,
-    "reading_timeout_seconds": 10.0,
+    "reading_timeout_seconds": 5.0,
     "confirmed_cooldown_seconds": 1.0,
     "restart_read_on_motion_after_confirm_seconds": 0.8,
-    "recent_read_seconds": 8.0,
+    "recent_read_seconds": 2.0,
     "min_confirm_votes": 2,
     "min_vote_margin": 1,
     "min_ocr_score": 0.80,
-    "fast_single_read_score": 0.97,
-    "known_plate_single_read_score": 0.86,
+    "fast_single_read_score": 0.95,
+    "known_plate_single_read_score": 0.82,
     "max_candidates_per_frame": 2,
-    "ocr_preprocess_variants": 2,
+    "ocr_preprocess_variants": 1,
     "ocr_target_width": 760,
     "known_plate_refresh_seconds": 2.0,
     "require_plate_in_database": False,
@@ -788,7 +788,7 @@ class PlateReaderApp:
         self.config = load_config()
         self.stop_event = threading.Event()
         self.frame_queue = queue.Queue(maxsize=4)
-        self.ocr_queue = queue.Queue(maxsize=4)
+        self.ocr_queue = queue.Queue(maxsize=1)
         self.ocr = RapidOCR()
 
         self.latest_frame = None
@@ -1124,6 +1124,11 @@ class PlateReaderApp:
                     self._copy_to_clipboard("")
 
     def _queue_ocr(self, frame):
+        while True:
+            try:
+                self.ocr_queue.get_nowait()
+            except queue.Empty:
+                break
         try:
             self.ocr_queue.put_nowait(("scan", frame))
         except queue.Full:
@@ -1135,6 +1140,11 @@ class PlateReaderApp:
                 _kind, frame = self.ocr_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
+            while True:
+                try:
+                    _kind, frame = self.ocr_queue.get_nowait()
+                except queue.Empty:
+                    break
 
             crop, offset = self._crop_roi(frame)
             candidates = self._read_frame(crop, offset)
@@ -1257,8 +1267,20 @@ class PlateReaderApp:
                     else:
                         current.score = min(0.99, max(current.score, candidate.score) + 0.03)
 
+            candidates = sorted(candidate_map.values(), key=lambda item: item.score, reverse=True)
+            if candidates and self._candidate_can_confirm_fast(candidates[0], known_plates):
+                return candidates[:5]
+
         candidates = sorted(candidate_map.values(), key=lambda item: item.score, reverse=True)
         return candidates[:5]
+
+    def _candidate_can_confirm_fast(self, candidate, known_plates):
+        threshold = (
+            float(self.config.get("known_plate_single_read_score", 0.82))
+            if candidate.text in known_plates
+            else float(self.config.get("fast_single_read_score", 0.95))
+        )
+        return float(candidate.score or 0.0) >= threshold
 
     def _handle_candidates(self, candidates):
         now = time.time()
