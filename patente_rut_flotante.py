@@ -601,7 +601,7 @@ class FloatingApp:
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Convertir patente a RUT  Flecha derecha", command=self.convert_active_patente)
         menu.add_command(label="Agregar / actualizar  Ctrl+Shift+G", command=self.open_add_dialog)
-        menu.add_command(label="Copiar RUT aleatorio  Ctrl x3", command=self.copy_random_rut)
+        menu.add_command(label="Copiar RUT aleatorio  Ctrl x2", command=self.copy_random_rut)
         menu.add_separator()
         menu.add_command(label="Volver a posicion inicial", command=self._reset_position)
         menu.add_command(label="Salir", command=self.close)
@@ -659,12 +659,12 @@ class FloatingApp:
                     time.sleep(0.018)
                     continue
                 if down and not last_down:
-                    self.ctrl_taps = [tap for tap in self.ctrl_taps if now - tap <= 1.05]
+                    self.ctrl_taps = [tap for tap in self.ctrl_taps if now - tap <= 0.75]
                     self.ctrl_taps.append(now)
-                    if len(self.ctrl_taps) >= 3:
+                    if len(self.ctrl_taps) >= 2:
                         self.ctrl_taps.clear()
                         self.root.after(0, self.copy_random_rut)
-                        time.sleep(0.35)
+                        time.sleep(0.45)
                 last_down = down
                 time.sleep(0.018)
 

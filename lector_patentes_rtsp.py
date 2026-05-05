@@ -34,12 +34,12 @@ DEFAULT_CONFIG = {
     "roi": [0.0, 0.0, 1.0, 1.0],
     "plate_polygon": [],
     "vehicle_roi": [0.0, 0.0, 1.0, 1.0],
-    "ocr_interval_seconds": 0.18,
+    "ocr_interval_seconds": 0.12,
     "always_scan": False,
     "auto_read_on_vehicle": True,
     "motion_enabled": True,
     "motion_threshold": 0.025,
-    "read_after_motion_delay_seconds": 0.15,
+    "read_after_motion_delay_seconds": 0.0,
     "reading_timeout_seconds": 5.0,
     "confirmed_cooldown_seconds": 1.0,
     "restart_read_on_motion_after_confirm_seconds": 0.8,
@@ -47,14 +47,15 @@ DEFAULT_CONFIG = {
     "min_confirm_votes": 2,
     "min_vote_margin": 1,
     "min_ocr_score": 0.80,
-    "fast_single_read_score": 0.95,
-    "known_plate_single_read_score": 0.82,
+    "fast_single_read_score": 0.93,
+    "known_plate_single_read_score": 0.80,
     "max_candidates_per_frame": 2,
     "ocr_preprocess_variants": 1,
     "ocr_target_width": 760,
     "known_plate_refresh_seconds": 2.0,
     "require_plate_in_database": False,
     "copy_confirmed_plate_to_clipboard": True,
+    "copy_provisional_plate_to_clipboard": True,
     "clear_clipboard_on_vehicle_start": True,
     "access_overlay_seconds": 2.5,
     "denied_message": "PATENTE EN LISTA DENEGADA",
@@ -806,6 +807,7 @@ class PlateReaderApp:
         self.current_candidates = []
         self.confirmed_plate = ""
         self.confirmed_rut = ""
+        self.provisional_plate = ""
         self.access_overlay = None
         self.known_plates = set()
         self.known_plates_loaded_at = 0
@@ -1020,6 +1022,7 @@ class PlateReaderApp:
         self.current_candidates = []
         self.confirmed_plate = ""
         self.confirmed_rut = ""
+        self.provisional_plate = ""
         self.vehicle_active = False
         self.cooldown_until = 0
         self.confirmed_at = 0
@@ -1088,12 +1091,16 @@ class PlateReaderApp:
         self.current_candidates = []
         self.confirmed_plate = ""
         self.confirmed_rut = ""
+        self.provisional_plate = ""
         self.confirmed_at = 0
         if self.config["clear_clipboard_on_vehicle_start"]:
             self._copy_to_clipboard("")
         self.plate_value.configure(text="Leyendo")
         self.rut_value.configure(text="Vehiculo detectado")
         self.status_value.configure(text="Vehiculo detectado. Leyendo patente automaticamente...")
+        if self.latest_frame is not None:
+            self.last_ocr_time = time.time()
+            self._queue_ocr(self.latest_frame.copy())
 
     def _maybe_queue_ocr(self):
         if self.latest_frame is None:
@@ -1320,9 +1327,9 @@ class PlateReaderApp:
         best_score_margin = float(best_stats["score_sum"]) - float(second_stats["score_sum"])
         best_is_known = self._is_known_plate(best)
         fast_threshold = (
-            float(self.config.get("known_plate_single_read_score", 0.86))
+            float(self.config.get("known_plate_single_read_score", 0.80))
             if best_is_known
-            else float(self.config.get("fast_single_read_score", 0.94))
+            else float(self.config.get("fast_single_read_score", 0.93))
         )
         fast_single_ok = (
             float(best_stats["max_score"]) >= fast_threshold
@@ -1341,6 +1348,7 @@ class PlateReaderApp:
                 return
 
             self.confirmed_plate = best
+            self.provisional_plate = best
             self.confirmed_at = now
             self.vehicle_active = False
             self.cooldown_until = now + float(self.config["confirmed_cooldown_seconds"])
@@ -1372,6 +1380,10 @@ class PlateReaderApp:
         elif not self.confirmed_plate:
             self.plate_value.configure(text=best)
             score = float(best_stats["max_score"])
+            if self.config.get("copy_provisional_plate_to_clipboard", True) and best != self.provisional_plate:
+                self.provisional_plate = best
+                self._copy_to_clipboard(best)
+                self.status_value.configure(text=f"Patente provisional copiada al portapapeles: {best}")
             self.rut_value.configure(text=f"Leyendo... {votes}/{self.config['min_confirm_votes']} ({score:0.2f})")
 
     def _copy_to_clipboard(self, text):

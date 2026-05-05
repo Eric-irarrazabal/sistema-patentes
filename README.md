@@ -18,7 +18,7 @@ Para agregar una asociacion:
 2. Ingresa patente y RUT.
 3. Presiona `Guardar`.
 
-Para copiar un RUT aleatorio de la lista al portapapeles, presiona `Ctrl` tres veces seguidas. Luego puedes pegarlo directo con `Ctrl+V`.
+Para copiar un RUT aleatorio de la lista al portapapeles, presiona `Ctrl` dos veces seguidas. Luego puedes pegarlo directo con `Ctrl+V`.
 
 ## Datos
 
@@ -51,7 +51,7 @@ Uso:
 
 Cuando una patente autorizada se confirma, aparece una pantalla completa verde durante al menos 2.5 segundos con la patente y el mensaje. Si esta en la lista de denegados, aparece una pantalla completa roja con acceso denegado. En ambos casos se emite un bip y la patente confirmada queda copiada al portapapeles. Si no esta en ninguna lista, solo queda copiada.
 
-La lectura prioriza rapidez y precision: procesa siempre el cuadro mas reciente, prepara la imagen de la zona de patente antes del OCR, descarta candidatos debiles y puede confirmar en una sola lectura cuando la confianza es alta o cuando calza con una patente ya registrada.
+La lectura prioriza rapidez y precision: procesa siempre el cuadro mas reciente, prepara la imagen de la zona de patente antes del OCR, descarta candidatos debiles y puede confirmar en una sola lectura cuando la confianza es alta o cuando calza con una patente ya registrada. En `1/2`, copia una patente provisional al portapapeles; cuando confirma, reemplaza por la definitiva.
 
 Si la camara no conecta, verifica que este PC este en la misma red que la camara y que el puerto RTSP `554` responda.
 
