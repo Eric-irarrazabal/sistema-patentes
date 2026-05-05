@@ -45,9 +45,11 @@ Uso:
 1. Revisa `camera_config.json`.
 2. Ejecuta `ejecutar_lector_patentes.bat`.
 3. La ventana queda en modo automatico: espera movimiento de vehiculo, lee patente y confirma cuando se repite.
-4. Usa `Lista acceso` para guardar patentes autorizadas y un mensaje opcional.
+4. Usa `Listas` para guardar patentes autorizadas o denegadas, cada una con mensaje opcional.
 
-Cuando una patente autorizada se confirma, aparece una pantalla completa verde durante al menos 2.5 segundos con la patente y el mensaje. Si la patente no esta autorizada, aparece una pantalla completa roja con acceso denegado. En ambos casos se emite un bip y la patente confirmada queda copiada al portapapeles.
+Cuando una patente autorizada se confirma, aparece una pantalla completa verde durante al menos 2.5 segundos con la patente y el mensaje. Si esta en la lista de denegados, aparece una pantalla completa roja con acceso denegado. En ambos casos se emite un bip y la patente confirmada queda copiada al portapapeles. Si no esta en ninguna lista, solo queda copiada.
+
+La lectura prioriza rapidez y precision: prepara la imagen de la zona de patente antes del OCR, descarta candidatos debiles y puede confirmar en una sola lectura cuando la confianza es alta o cuando calza con una patente ya registrada.
 
 Si la camara no conecta, verifica que este PC este en la misma red que la camara y que el puerto RTSP `554` responda.
 

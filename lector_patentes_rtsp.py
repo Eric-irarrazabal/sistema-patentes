@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 import winsound
-from collections import Counter, deque
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
@@ -47,11 +47,17 @@ DEFAULT_CONFIG = {
     "min_confirm_votes": 2,
     "min_vote_margin": 1,
     "min_ocr_score": 0.80,
+    "fast_single_read_score": 0.97,
+    "known_plate_single_read_score": 0.86,
+    "max_candidates_per_frame": 2,
+    "ocr_preprocess_variants": 2,
+    "ocr_target_width": 760,
+    "known_plate_refresh_seconds": 2.0,
     "require_plate_in_database": False,
     "copy_confirmed_plate_to_clipboard": True,
     "clear_clipboard_on_vehicle_start": True,
     "access_overlay_seconds": 2.5,
-    "denied_message": "PATENTE NO REGISTRADA",
+    "denied_message": "PATENTE EN LISTA DENEGADA",
     "max_frame_width": 1280,
     "open_timeout_ms": 5000,
     "read_timeout_ms": 5000,
@@ -89,6 +95,17 @@ LETTER_FIX = str.maketrans(
 )
 
 
+CONFUSION_GROUPS = (
+    set("0OQD"),
+    set("1IL"),
+    set("2Z"),
+    set("5S"),
+    set("8B"),
+    set("6G"),
+    set("7T"),
+)
+
+
 @dataclass
 class OcrCandidate:
     text: str
@@ -120,6 +137,46 @@ def looks_like_plate(value):
     return any(pattern.match(value) for pattern in PLATE_PATTERNS)
 
 
+def chars_are_confusable(left, right):
+    if left == right:
+        return True
+    return any(left in group and right in group for group in CONFUSION_GROUPS)
+
+
+def known_plate_distance(candidate, known_plate):
+    candidate = normalize_plate_text(candidate)
+    known_plate = normalize_plate_text(known_plate)
+    if len(candidate) != len(known_plate):
+        return float("inf")
+
+    distance = 0.0
+    for left, right in zip(candidate, known_plate):
+        if left == right:
+            continue
+        if chars_are_confusable(left, right):
+            distance += 0.4
+        else:
+            distance += 1.0
+    return distance
+
+
+def correct_to_known_plate(candidate, score, known_plates):
+    if not known_plates:
+        return candidate, score
+    if candidate in known_plates:
+        return candidate, min(0.99, score + 0.06)
+
+    ranked = sorted((known_plate_distance(candidate, plate), plate) for plate in known_plates if len(plate) == len(candidate))
+    if not ranked:
+        return candidate, score
+
+    best_distance, best_plate = ranked[0]
+    second_distance = ranked[1][0] if len(ranked) > 1 else float("inf")
+    if best_distance <= 0.85 and second_distance - best_distance >= 0.25:
+        return best_plate, min(0.99, score + 0.04)
+    return candidate, score
+
+
 def positional_plate_variants(value):
     value = normalize_plate_text(value)
     if len(value) != 6:
@@ -144,26 +201,35 @@ def positional_plate_variants(value):
     return unique
 
 
-def extract_plate_candidates(text, score, box):
+def extract_plate_candidates(text, score, box, known_plates=None):
     raw = normalize_plate_text(text)
     if not raw:
         return []
 
     candidates = []
-    pieces = [raw]
+    known_plates = known_plates or set()
+    pieces = [raw] if len(raw) == 6 else []
 
-    for match in re.finditer(r"[A-Z0-9]{6}", raw):
-        pieces.append(match.group(0))
+    if len(raw) > 6:
+        pieces.extend(raw[index : index + 6] for index in range(0, len(raw) - 5))
 
     for piece in pieces:
-        for variant in [piece, *positional_plate_variants(piece)]:
+        for index, variant in enumerate([piece, *positional_plate_variants(piece)]):
             if looks_like_plate(variant):
-                candidates.append(OcrCandidate(variant, float(score or 0.0), box))
+                adjusted_score = float(score or 0.0)
+                if index > 0:
+                    adjusted_score *= 0.94
+                if piece != raw:
+                    adjusted_score *= 0.98
+                variant, adjusted_score = correct_to_known_plate(variant, adjusted_score, known_plates)
+                candidates.append(OcrCandidate(variant, adjusted_score, box))
 
     unique = {}
     for candidate in candidates:
-        unique.setdefault(candidate.text, candidate)
-    return list(unique.values())
+        current = unique.get(candidate.text)
+        if current is None or candidate.score > current.score:
+            unique[candidate.text] = candidate
+    return sorted(unique.values(), key=lambda item: item.score, reverse=True)
 
 
 def get_rut_for_plate(plate):
@@ -178,11 +244,51 @@ def get_rut_for_plate(plate):
         return None
 
 
+def table_exists(conn, table_name):
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)).fetchone()
+    return bool(row)
+
+
+def list_known_plates():
+    ensure_access_table()
+    ensure_denied_table()
+    conn = sqlite3.connect(DB_PATH)
+    plates = set()
+    try:
+        if table_exists(conn, "patente_rut"):
+            plates.update(row[0] for row in conn.execute("SELECT patente FROM patente_rut"))
+        if table_exists(conn, "access_patentes"):
+            plates.update(row[0] for row in conn.execute("SELECT patente FROM access_patentes"))
+        if table_exists(conn, "denied_patentes"):
+            plates.update(row[0] for row in conn.execute("SELECT patente FROM denied_patentes"))
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    return {normalize_db_plate(plate) for plate in plates if looks_like_plate(plate)}
+
+
 def ensure_access_table():
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS access_patentes (
+            patente TEXT PRIMARY KEY,
+            mensaje TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def ensure_denied_table():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS denied_patentes (
             patente TEXT PRIMARY KEY,
             mensaje TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -217,6 +323,7 @@ def upsert_access_plate(plate, message=""):
     )
     conn.commit()
     conn.close()
+    delete_denied_plate(plate)
     return plate
 
 
@@ -234,6 +341,56 @@ def list_access_plates():
     rows = conn.execute("SELECT patente, mensaje FROM access_patentes ORDER BY patente").fetchall()
     conn.close()
     return rows
+
+
+def upsert_denied_plate(plate, message=""):
+    plate = normalize_db_plate(plate)
+    message = (message or "").strip()
+    if not looks_like_plate(plate):
+        raise ValueError("La patente debe tener formato ABCD12 o AB1234.")
+    ensure_denied_table()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        INSERT INTO denied_patentes (patente, mensaje)
+        VALUES (?, ?)
+        ON CONFLICT(patente) DO UPDATE SET
+            mensaje = excluded.mensaje,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (plate, message),
+    )
+    conn.commit()
+    conn.close()
+    delete_access_plate(plate)
+    return plate
+
+
+def delete_denied_plate(plate):
+    ensure_denied_table()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM denied_patentes WHERE patente = ?", (normalize_db_plate(plate),))
+    conn.commit()
+    conn.close()
+
+
+def list_denied_plates():
+    ensure_denied_table()
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT patente, mensaje FROM denied_patentes ORDER BY patente").fetchall()
+    conn.close()
+    return rows
+
+
+def get_denied_record(plate):
+    ensure_denied_table()
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT patente, mensaje FROM denied_patentes WHERE patente = ?",
+        (normalize_db_plate(plate),),
+    ).fetchone()
+    conn.close()
+    return row
 
 
 def get_access_record(plate):
@@ -260,20 +417,45 @@ def enforce_single_instance(name):
 
 
 class AccessListDialog:
+    MODES = {
+        "access": {
+            "title": "PATENTES CON ACCESO",
+            "save": "Guardar acceso",
+            "saved": "guardada para dar acceso",
+            "deleted": "borrada de acceso",
+            "confirm": "Borrar {plate} de la lista de acceso?",
+            "empty": "patente(s) autorizada(s).",
+            "color": "#16a34a",
+            "active": "#15803d",
+        },
+        "denied": {
+            "title": "PATENTES DENEGADAS",
+            "save": "Guardar denegado",
+            "saved": "guardada para acceso denegado",
+            "deleted": "borrada de denegados",
+            "confirm": "Borrar {plate} de la lista de denegados?",
+            "empty": "patente(s) denegada(s).",
+            "color": "#b91c1c",
+            "active": "#991b1b",
+        },
+    }
+
     def __init__(self, parent):
         self.parent = parent
         self.rows = []
         self.window = tk.Toplevel(parent)
-        self.window.title("Lista acceso")
-        self.window.geometry("560x520")
+        self.window.title("Listas de patentes")
+        self.window.geometry("600x550")
         self.window.configure(bg="#0f172a")
         self.window.attributes("-topmost", True)
         self.window.transient(parent)
         self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
 
+        self.mode_var = tk.StringVar(value="access")
+        self.title_var = tk.StringVar()
         self.plate_var = tk.StringVar()
         self.message_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="Guarda patentes autorizadas para dar acceso.")
+        self.status_var = tk.StringVar(value="Guarda patentes autorizadas o denegadas.")
 
         self._build()
         self.reload()
@@ -282,11 +464,48 @@ class AccessListDialog:
     def _build(self):
         tk.Label(
             self.window,
-            text="PATENTES CON ACCESO",
+            textvariable=self.title_var,
             bg="#0f172a",
             fg="#f8fafc",
             font=("Segoe UI", 18, "bold"),
         ).pack(anchor="w", padx=18, pady=(16, 10))
+
+        mode_row = tk.Frame(self.window, bg="#0f172a")
+        mode_row.pack(fill="x", padx=18, pady=(0, 12))
+        tk.Radiobutton(
+            mode_row,
+            text="DAR ACCESO",
+            variable=self.mode_var,
+            value="access",
+            command=self.reload,
+            indicatoron=False,
+            bg="#16a34a",
+            fg="white",
+            selectcolor="#15803d",
+            activebackground="#15803d",
+            activeforeground="white",
+            relief="flat",
+            padx=18,
+            pady=8,
+            font=("Segoe UI", 10, "bold"),
+        ).pack(side="left")
+        tk.Radiobutton(
+            mode_row,
+            text="DENEGAR",
+            variable=self.mode_var,
+            value="denied",
+            command=self.reload,
+            indicatoron=False,
+            bg="#b91c1c",
+            fg="white",
+            selectcolor="#991b1b",
+            activebackground="#991b1b",
+            activeforeground="white",
+            relief="flat",
+            padx=18,
+            pady=8,
+            font=("Segoe UI", 10, "bold"),
+        ).pack(side="left", padx=(8, 0))
 
         form = tk.Frame(self.window, bg="#0f172a")
         form.pack(fill="x", padx=18)
@@ -326,7 +545,7 @@ class AccessListDialog:
 
         buttons = tk.Frame(self.window, bg="#0f172a")
         buttons.pack(fill="x", padx=18, pady=14)
-        tk.Button(
+        self.save_button = tk.Button(
             buttons,
             text="Guardar",
             command=self.save,
@@ -337,14 +556,15 @@ class AccessListDialog:
             relief="flat",
             padx=12,
             pady=7,
-        ).pack(side="left")
+        )
+        self.save_button.pack(side="left")
         tk.Button(
             buttons,
             text="Borrar",
             command=self.delete_selected,
-            bg="#b91c1c",
+            bg="#64748b",
             fg="white",
-            activebackground="#991b1b",
+            activebackground="#475569",
             activeforeground="white",
             relief="flat",
             padx=12,
@@ -398,40 +618,55 @@ class AccessListDialog:
             bg="#0f172a",
             fg="#cbd5e1",
             font=("Segoe UI", 10),
-            wraplength=510,
+            wraplength=550,
             justify="left",
         ).pack(anchor="w", padx=18, pady=(0, 16))
 
+    def _mode(self):
+        return self.MODES[self.mode_var.get()]
+
     def reload(self):
-        self.rows = list_access_plates()
+        mode = self._mode()
+        self.rows = list_access_plates() if self.mode_var.get() == "access" else list_denied_plates()
+        self.title_var.set(mode["title"])
+        self.save_button.configure(text=mode["save"], bg=mode["color"], activebackground=mode["active"])
+        self.listbox.configure(selectbackground=mode["color"])
         self.listbox.delete(0, tk.END)
         for plate, message in self.rows:
             suffix = f" | {message.upper()}" if message else ""
             self.listbox.insert(tk.END, f"{plate:<8}{suffix}")
-        self.status_var.set(f"{len(self.rows)} patente(s) autorizada(s).")
+        self.status_var.set(f"{len(self.rows)} {mode['empty']}")
 
     def save(self):
+        mode = self._mode()
         try:
-            plate = upsert_access_plate(self.plate_var.get(), self.message_var.get())
+            if self.mode_var.get() == "access":
+                plate = upsert_access_plate(self.plate_var.get(), self.message_var.get())
+            else:
+                plate = upsert_denied_plate(self.plate_var.get(), self.message_var.get())
         except ValueError as exc:
             messagebox.showwarning(APP_NAME, str(exc), parent=self.window)
             return
         self.reload()
         self._select_plate(plate)
-        self.status_var.set(f"{plate} guardada para dar acceso.")
+        self.status_var.set(f"{plate} {mode['saved']}.")
 
     def delete_selected(self):
+        mode = self._mode()
         plate = self._current_plate() or normalize_db_plate(self.plate_var.get())
         if not plate:
             messagebox.showwarning(APP_NAME, "Selecciona o escribe una patente para borrar.", parent=self.window)
             return
-        if not messagebox.askyesno(APP_NAME, f"Borrar {plate} de la lista de acceso?", parent=self.window):
+        if not messagebox.askyesno(APP_NAME, mode["confirm"].format(plate=plate), parent=self.window):
             return
-        delete_access_plate(plate)
+        if self.mode_var.get() == "access":
+            delete_access_plate(plate)
+        else:
+            delete_denied_plate(plate)
         self.plate_var.set("")
         self.message_var.set("")
         self.reload()
-        self.status_var.set(f"{plate} borrada de la lista de acceso.")
+        self.status_var.set(f"{plate} {mode['deleted']}.")
 
     def _on_select(self, _event=None):
         index = self._selected_index()
@@ -572,6 +807,8 @@ class PlateReaderApp:
         self.confirmed_plate = ""
         self.confirmed_rut = ""
         self.access_overlay = None
+        self.known_plates = set()
+        self.known_plates_loaded_at = 0
         self.selecting_polygon = False
         self.pending_polygon = []
         self.display_info = None
@@ -582,6 +819,7 @@ class PlateReaderApp:
         self.root.configure(bg="#0f172a")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         ensure_access_table()
+        ensure_denied_table()
 
         self._build_ui()
         self._start_workers()
@@ -696,7 +934,7 @@ class PlateReaderApp:
         button_row3.pack(fill="x", pady=(0, 12))
         tk.Button(
             button_row3,
-            text="Lista acceso",
+            text="Listas",
             command=self.open_access_dialog,
             bg="#16a34a",
             fg="white",
@@ -941,32 +1179,92 @@ class PlateReaderApp:
         y2 = max(y1 + 1, min(height, int(bottom * height)))
         return frame[y1:y2, x1:x2], (x1, y1)
 
+    def _get_known_plates(self):
+        now = time.time()
+        refresh_seconds = float(self.config.get("known_plate_refresh_seconds", 2.0))
+        if now - self.known_plates_loaded_at >= refresh_seconds:
+            self.known_plates = list_known_plates()
+            self.known_plates_loaded_at = now
+        return self.known_plates
+
+    def _is_known_plate(self, plate):
+        return normalize_db_plate(plate) in self._get_known_plates()
+
+    def _prepare_ocr_images(self, crop):
+        if crop is None or crop.size == 0:
+            return []
+
+        height, width = crop.shape[:2]
+        target_width = max(320, int(self.config.get("ocr_target_width", 760)))
+        scale = 1.0
+        if width < target_width:
+            scale = min(3.0, target_width / max(1, width))
+        elif width > target_width * 1.4:
+            scale = target_width / max(1, width)
+
+        resized = crop
+        if abs(scale - 1.0) > 0.05:
+            interpolation = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+            resized = cv2.resize(crop, (int(width * scale), int(height * scale)), interpolation=interpolation)
+
+        variants = [("base", resized, scale)]
+        extra_variants = max(0, int(self.config.get("ocr_preprocess_variants", 2)))
+        if extra_variants <= 0:
+            return variants
+
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
+        sharpened = cv2.filter2D(
+            clahe,
+            -1,
+            np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32),
+        )
+        variants.append(("sharp", cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR), scale))
+
+        if extra_variants >= 2:
+            binary = cv2.adaptiveThreshold(
+                sharpened,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                31,
+                7,
+            )
+            variants.append(("binary", cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR), scale))
+
+        return variants
+
     def _read_frame(self, crop, offset):
-        try:
-            results, _elapsed = self.ocr(crop)
-        except Exception as exc:
-            self.frame_queue.put(("status", f"Error OCR: {exc}"))
-            return []
-
-        if not results:
-            return []
-
-        candidates = []
+        known_plates = self._get_known_plates()
+        candidate_map = {}
         ox, oy = offset
-        for result in results:
-            box, text, score = result
-            if float(score or 0.0) < float(self.config["min_ocr_score"]):
-                continue
-            fixed_box = [[int(x + ox), int(y + oy)] for x, y in box]
-            candidates.extend(extract_plate_candidates(text, score, fixed_box))
+        for _name, image, scale in self._prepare_ocr_images(crop):
+            try:
+                results, _elapsed = self.ocr(image)
+            except Exception as exc:
+                self.frame_queue.put(("status", f"Error OCR: {exc}"))
+                return []
 
-        candidates.sort(key=lambda item: item.score, reverse=True)
+            for result in results or []:
+                box, text, score = result
+                if float(score or 0.0) < float(self.config["min_ocr_score"]):
+                    continue
+                fixed_box = [[int(x / scale + ox), int(y / scale + oy)] for x, y in box]
+                for candidate in extract_plate_candidates(text, score, fixed_box, known_plates):
+                    current = candidate_map.get(candidate.text)
+                    if current is None:
+                        candidate_map[candidate.text] = candidate
+                    else:
+                        current.score = min(0.99, max(current.score, candidate.score) + 0.03)
+
+        candidates = sorted(candidate_map.values(), key=lambda item: item.score, reverse=True)
         return candidates[:5]
 
     def _handle_candidates(self, candidates):
         now = time.time()
         self.current_candidates = candidates
-        for candidate in candidates:
+        max_candidates = max(1, int(self.config.get("max_candidates_per_frame", 2)))
+        for candidate in candidates[:max_candidates]:
             self.recent_reads.append((now, candidate.text, candidate.score))
 
         while self.recent_reads and now - self.recent_reads[0][0] > float(self.config["recent_read_seconds"]):
@@ -980,18 +1278,38 @@ class PlateReaderApp:
     def _update_confirmation(self):
         if not self.recent_reads:
             return
-        counts = Counter(text for _t, text, _score in self.recent_reads)
-        ranked = counts.most_common(2)
-        best, votes = ranked[0]
-        second_votes = ranked[1][1] if len(ranked) > 1 else 0
+        stats = {}
+        for _t, text, score in self.recent_reads:
+            row = stats.setdefault(text, {"votes": 0, "score_sum": 0.0, "max_score": 0.0})
+            row["votes"] += 1
+            row["score_sum"] += float(score or 0.0)
+            row["max_score"] = max(row["max_score"], float(score or 0.0))
+
+        ranked = sorted(
+            stats.items(),
+            key=lambda item: (item[1]["votes"], item[1]["score_sum"], item[1]["max_score"]),
+            reverse=True,
+        )
+        best, best_stats = ranked[0]
+        second_stats = ranked[1][1] if len(ranked) > 1 else {"votes": 0, "score_sum": 0.0, "max_score": 0.0}
+        votes = int(best_stats["votes"])
+        second_votes = int(second_stats["votes"])
         vote_margin = votes - second_votes
+        best_score_margin = float(best_stats["score_sum"]) - float(second_stats["score_sum"])
+        best_is_known = self._is_known_plate(best)
+        fast_threshold = (
+            float(self.config.get("known_plate_single_read_score", 0.86))
+            if best_is_known
+            else float(self.config.get("fast_single_read_score", 0.94))
+        )
+        fast_single_ok = (
+            float(best_stats["max_score"]) >= fast_threshold
+            and (second_votes == 0 or best_score_margin >= 0.08)
+        )
+        votes_ok = votes >= int(self.config["min_confirm_votes"]) and vote_margin >= int(self.config["min_vote_margin"])
         if self.confirmed_plate == best:
             return
-        if votes >= int(self.config["min_confirm_votes"]):
-            if vote_margin < int(self.config["min_vote_margin"]):
-                self.status_value.configure(text=f"Lectura ambigua: {best} compite con otra patente. No se copia.")
-                return
-
+        if fast_single_ok or votes_ok:
             now = time.time()
             rut = get_rut_for_plate(best)
             if self.config["require_plate_in_database"] and not rut:
@@ -1017,10 +1335,22 @@ class PlateReaderApp:
                 _stored_plate, access_message = access_record
                 self._show_access_overlay(best, True, access_message)
             else:
-                self._show_access_overlay(best, False, self.config.get("denied_message", ""))
+                denied_record = get_denied_record(best)
+                if denied_record:
+                    _stored_plate, denied_message = denied_record
+                    self._show_access_overlay(
+                        best,
+                        False,
+                        denied_message or self.config.get("denied_message", ""),
+                    )
+                else:
+                    self.status_value.configure(text=f"Patente copiada sin regla de acceso/denegado: {best}")
+        elif votes >= int(self.config["min_confirm_votes"]) and vote_margin < int(self.config["min_vote_margin"]):
+            self.status_value.configure(text=f"Lectura ambigua: {best} compite con otra patente. No se copia.")
         elif not self.confirmed_plate:
             self.plate_value.configure(text=best)
-            self.rut_value.configure(text=f"Leyendo... {votes}/{self.config['min_confirm_votes']}")
+            score = float(best_stats["max_score"])
+            self.rut_value.configure(text=f"Leyendo... {votes}/{self.config['min_confirm_votes']} ({score:0.2f})")
 
     def _copy_to_clipboard(self, text):
         self.root.clipboard_clear()
@@ -1273,6 +1603,10 @@ def run_self_test():
     assert looks_like_plate("ZY1234")
     assert positional_plate_variants("ABCD1Z")[0] == "ABCD12"
     assert extract_plate_candidates("ABCD12", 0.99, [])[0].text == "ABCD12"
+    assert any(candidate.text == "ABCD12" for candidate in extract_plate_candidates("CHILEABCD12", 0.99, []))
+    corrected, corrected_score = correct_to_known_plate("ABCD1Z", 0.80, {"ABCD12"})
+    assert corrected == "ABCD12"
+    assert corrected_score > 0.80
 
     image = np.full((140, 420, 3), 255, dtype=np.uint8)
     cv2.rectangle(image, (15, 20), (405, 120), (20, 20, 20), 3)
