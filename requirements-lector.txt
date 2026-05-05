@@ -2,3 +2,4 @@ opencv-python
 rapidocr-onnxruntime
 pillow
 pyinstaller
+screeninfo

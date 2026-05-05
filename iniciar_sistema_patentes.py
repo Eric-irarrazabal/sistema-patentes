@@ -37,6 +37,8 @@ def main():
         start_exe(APP_DIR / "PatenteRUTFlotante.exe")
         time.sleep(0.5)
         start_exe(APP_DIR / "LectorPatentesRTSP.exe")
+        time.sleep(0.5)
+        start_exe(APP_DIR / "VerPatentesManual.exe")
     except Exception as exc:
         messagebox.showerror(APP_NAME, str(exc))
 

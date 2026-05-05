@@ -54,5 +54,10 @@ El lanzador `IniciarSistemaPatentes.exe` abre juntos:
 
 - `PatenteRUTFlotante.exe`
 - `LectorPatentesRTSP.exe`
+- `VerPatentesManual.exe`
 
 Para reconstruir todo usa `crear_ejecutables_completos.bat`.
+
+## Modo Manual
+
+`VerPatentesManual.exe` queda corriendo en segundo plano. Manten `CTRL` presionado por 1 segundo para abrir una foto congelada de la camara en pantalla completa. Al soltar `CTRL`, la ventana se cierra. Usa `ESC` para cerrar ese modo.

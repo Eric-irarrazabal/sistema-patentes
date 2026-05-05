@@ -9,6 +9,10 @@ echo Creando LectorPatentesRTSP.exe...
 ".venv-placas\Scripts\pyinstaller.exe" --noconsole --onefile --collect-data rapidocr_onnxruntime --name LectorPatentesRTSP lector_patentes_rtsp.py
 
 echo.
+echo Creando VerPatentesManual.exe...
+".venv-placas\Scripts\pyinstaller.exe" --noconsole --onefile --name VerPatentesManual ver_patentes_manual.py
+
+echo.
 echo Creando IniciarSistemaPatentes.exe...
 pyinstaller --noconsole --onefile --name IniciarSistemaPatentes iniciar_sistema_patentes.py
 
