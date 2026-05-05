@@ -18,6 +18,8 @@ Para agregar una asociacion:
 2. Ingresa patente y RUT.
 3. Presiona `Guardar`.
 
+Para copiar un RUT aleatorio de la lista al portapapeles, presiona `Ctrl` tres veces seguidas. Luego puedes pegarlo directo con `Ctrl+V`.
+
 ## Datos
 
 La base de datos se crea automaticamente como `patentes_rut.sqlite3` en esta misma carpeta. Parte vacia para no incluir datos reales; las asociaciones se agregan desde el boton `+`.

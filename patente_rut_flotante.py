@@ -1,5 +1,6 @@
 import ctypes
 import json
+import random
 import re
 import sqlite3
 import sys
@@ -125,6 +126,18 @@ class PlateRutDatabase:
                 return candidate, rut
         return None, None
 
+    def random_rut(self):
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT rut
+            FROM patente_rut
+            WHERE rut IS NOT NULL AND rut <> ''
+            """
+        ).fetchall()
+        if not rows:
+            return None
+        return random.choice(rows)[0]
+
 
 class Win32:
     user32 = ctypes.windll.user32
@@ -204,6 +217,8 @@ def configure_win32_api():
     Win32.kernel32.GlobalUnlock.restype = ctypes.c_bool
     Win32.kernel32.GetCurrentThreadId.argtypes = []
     Win32.kernel32.GetCurrentThreadId.restype = ctypes.c_ulong
+    Win32.user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    Win32.user32.GetAsyncKeyState.restype = ctypes.c_short
 
     Win32.user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     Win32.user32.GetAncestor.restype = ctypes.c_void_p
@@ -346,9 +361,12 @@ class FloatingApp:
         self.last_target_hwnd = None
         self.hotkey_thread_id = None
         self.hotkeys_running = True
+        self.ctrl_watcher_running = True
         self.busy = False
         self.drag_start = None
         self.flash_job = None
+        self.ctrl_taps = []
+        self.ignore_ctrl_taps_until = 0
 
         self._build_ui()
         self._place_window()
@@ -357,6 +375,7 @@ class FloatingApp:
         self._make_no_activate(self.root_hwnd)
         self._remember_foreground()
         self._start_hotkeys()
+        self._start_ctrl_tap_watcher()
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -462,6 +481,9 @@ class FloatingApp:
             if attached:
                 Win32.user32.AttachThreadInput(current_thread, target_thread, False)
 
+    def _suppress_ctrl_taps(self, seconds=0.7):
+        self.ignore_ctrl_taps_until = max(self.ignore_ctrl_taps_until, time.monotonic() + seconds)
+
     def _copy_active_field(self):
         original_clipboard = Clipboard.get_text()
         copied = ""
@@ -471,8 +493,10 @@ class FloatingApp:
             self._activate_target()
             Clipboard.set_text(sentinel)
             time.sleep(0.04)
+            self._suppress_ctrl_taps()
             press_hotkey(Win32.VK_CONTROL, Win32.VK_A)
             time.sleep(0.07)
+            self._suppress_ctrl_taps()
             press_hotkey(Win32.VK_CONTROL, Win32.VK_C)
 
             for _ in range(20):
@@ -495,8 +519,10 @@ class FloatingApp:
         self._activate_target()
         Clipboard.set_text(text)
         time.sleep(0.04)
+        self._suppress_ctrl_taps()
         press_hotkey(Win32.VK_CONTROL, Win32.VK_A)
         time.sleep(0.07)
+        self._suppress_ctrl_taps()
         press_hotkey(Win32.VK_CONTROL, Win32.VK_V)
         time.sleep(0.30)
         Clipboard.set_text(original_clipboard)
@@ -541,6 +567,25 @@ class FloatingApp:
     def _on_saved_mapping(self, patente, rut):
         self._flash("+OK", "#2563eb")
 
+    def copy_random_rut(self):
+        if self.busy:
+            return
+        self.busy = True
+        try:
+            rut = self.db.random_rut()
+            if not rut:
+                self._flash("SIN", "#dc2626")
+                Win32.user32.MessageBeep(0xFFFFFFFF)
+                return
+            Clipboard.set_text(rut)
+            self._flash("RND", "#7c3aed")
+            Win32.user32.MessageBeep(0xFFFFFFFF)
+        except Exception as exc:
+            self._flash("ERR", "#dc2626")
+            messagebox.showerror(APP_NAME, str(exc))
+        finally:
+            self.busy = False
+
     def _flash(self, text, color):
         if self.flash_job:
             self.root.after_cancel(self.flash_job)
@@ -558,6 +603,7 @@ class FloatingApp:
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Convertir patente a RUT  Flecha derecha", command=self.convert_active_patente)
         menu.add_command(label="Agregar / actualizar  Ctrl+Shift+G", command=self.open_add_dialog)
+        menu.add_command(label="Copiar RUT aleatorio  Ctrl x3", command=self.copy_random_rut)
         menu.add_separator()
         menu.add_command(label="Volver a posicion inicial", command=self._reset_position)
         menu.add_command(label="Salir", command=self.close)
@@ -603,8 +649,32 @@ class FloatingApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _start_ctrl_tap_watcher(self):
+        def worker():
+            last_down = False
+            while self.ctrl_watcher_running:
+                down = bool(Win32.user32.GetAsyncKeyState(Win32.VK_CONTROL) & 0x8000)
+                now = time.monotonic()
+                if self.busy or now < self.ignore_ctrl_taps_until:
+                    self.ctrl_taps.clear()
+                    last_down = down
+                    time.sleep(0.018)
+                    continue
+                if down and not last_down:
+                    self.ctrl_taps = [tap for tap in self.ctrl_taps if now - tap <= 1.05]
+                    self.ctrl_taps.append(now)
+                    if len(self.ctrl_taps) >= 3:
+                        self.ctrl_taps.clear()
+                        self.root.after(0, self.copy_random_rut)
+                        time.sleep(0.35)
+                last_down = down
+                time.sleep(0.018)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def close(self):
         self.hotkeys_running = False
+        self.ctrl_watcher_running = False
         try:
             if self.hotkey_thread_id:
                 Win32.user32.PostThreadMessageW(self.hotkey_thread_id, 0x0012, 0, 0)
@@ -715,6 +785,7 @@ def run_self_tests():
         assert db.lookup_patente("abcd12") == "12345678K"
         assert db.lookup_text("ABCD12")[1] == "12345678K"
         assert db.lookup_text("ABCD12 12345678K")[1] == "12345678K"
+        assert db.random_rut() == "12345678K"
         db.close()
 
 
