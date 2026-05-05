@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import threading
 import time
+import winsound
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,22 +34,24 @@ DEFAULT_CONFIG = {
     "roi": [0.0, 0.0, 1.0, 1.0],
     "plate_polygon": [],
     "vehicle_roi": [0.0, 0.0, 1.0, 1.0],
-    "ocr_interval_seconds": 0.75,
+    "ocr_interval_seconds": 0.35,
     "always_scan": False,
     "auto_read_on_vehicle": True,
     "motion_enabled": True,
     "motion_threshold": 0.025,
-    "read_after_motion_delay_seconds": 0.35,
+    "read_after_motion_delay_seconds": 0.15,
     "reading_timeout_seconds": 10.0,
     "confirmed_cooldown_seconds": 1.0,
     "restart_read_on_motion_after_confirm_seconds": 0.8,
     "recent_read_seconds": 8.0,
-    "min_confirm_votes": 4,
-    "min_vote_margin": 2,
-    "min_ocr_score": 0.82,
+    "min_confirm_votes": 2,
+    "min_vote_margin": 1,
+    "min_ocr_score": 0.80,
     "require_plate_in_database": False,
     "copy_confirmed_plate_to_clipboard": True,
     "clear_clipboard_on_vehicle_start": True,
+    "access_overlay_seconds": 2.5,
+    "denied_message": "PATENTE NO REGISTRADA",
     "max_frame_width": 1280,
     "open_timeout_ms": 5000,
     "read_timeout_ms": 5000,
@@ -175,6 +178,75 @@ def get_rut_for_plate(plate):
         return None
 
 
+def ensure_access_table():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS access_patentes (
+            patente TEXT PRIMARY KEY,
+            mensaje TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def normalize_db_plate(plate):
+    return normalize_plate_text(plate)
+
+
+def upsert_access_plate(plate, message=""):
+    plate = normalize_db_plate(plate)
+    message = (message or "").strip()
+    if not looks_like_plate(plate):
+        raise ValueError("La patente debe tener formato ABCD12 o AB1234.")
+    ensure_access_table()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        INSERT INTO access_patentes (patente, mensaje)
+        VALUES (?, ?)
+        ON CONFLICT(patente) DO UPDATE SET
+            mensaje = excluded.mensaje,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (plate, message),
+    )
+    conn.commit()
+    conn.close()
+    return plate
+
+
+def delete_access_plate(plate):
+    ensure_access_table()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM access_patentes WHERE patente = ?", (normalize_db_plate(plate),))
+    conn.commit()
+    conn.close()
+
+
+def list_access_plates():
+    ensure_access_table()
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT patente, mensaje FROM access_patentes ORDER BY patente").fetchall()
+    conn.close()
+    return rows
+
+
+def get_access_record(plate):
+    ensure_access_table()
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT patente, mensaje FROM access_patentes WHERE patente = ?",
+        (normalize_db_plate(plate),),
+    ).fetchone()
+    conn.close()
+    return row
+
+
 def enforce_single_instance(name):
     global _SINGLE_INSTANCE_MUTEX
     kernel32 = ctypes.windll.kernel32
@@ -185,6 +257,210 @@ def enforce_single_instance(name):
     _SINGLE_INSTANCE_MUTEX = kernel32.CreateMutexW(None, False, name)
     if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
         sys.exit(0)
+
+
+class AccessListDialog:
+    def __init__(self, parent):
+        self.parent = parent
+        self.rows = []
+        self.window = tk.Toplevel(parent)
+        self.window.title("Lista acceso")
+        self.window.geometry("560x520")
+        self.window.configure(bg="#0f172a")
+        self.window.attributes("-topmost", True)
+        self.window.transient(parent)
+        self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
+
+        self.plate_var = tk.StringVar()
+        self.message_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="Guarda patentes autorizadas para dar acceso.")
+
+        self._build()
+        self.reload()
+        self.plate_entry.focus_set()
+
+    def _build(self):
+        tk.Label(
+            self.window,
+            text="PATENTES CON ACCESO",
+            bg="#0f172a",
+            fg="#f8fafc",
+            font=("Segoe UI", 18, "bold"),
+        ).pack(anchor="w", padx=18, pady=(16, 10))
+
+        form = tk.Frame(self.window, bg="#0f172a")
+        form.pack(fill="x", padx=18)
+
+        tk.Label(form, text="PATENTE", bg="#0f172a", fg="#93c5fd", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky="w"
+        )
+        tk.Label(form, text="MENSAJE OPCIONAL", bg="#0f172a", fg="#93c5fd", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=1, sticky="w", padx=(12, 0)
+        )
+
+        self.plate_entry = tk.Entry(
+            form,
+            textvariable=self.plate_var,
+            bg="#020617",
+            fg="#f8fafc",
+            insertbackground="#f8fafc",
+            relief="flat",
+            font=("Segoe UI", 16, "bold"),
+        )
+        self.plate_entry.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.plate_entry.bind("<Return>", lambda _event: self.save())
+
+        self.message_entry = tk.Entry(
+            form,
+            textvariable=self.message_var,
+            bg="#020617",
+            fg="#f8fafc",
+            insertbackground="#f8fafc",
+            relief="flat",
+            font=("Segoe UI", 12),
+        )
+        self.message_entry.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(4, 0))
+        self.message_entry.bind("<Return>", lambda _event: self.save())
+        form.grid_columnconfigure(0, weight=1)
+        form.grid_columnconfigure(1, weight=2)
+
+        buttons = tk.Frame(self.window, bg="#0f172a")
+        buttons.pack(fill="x", padx=18, pady=14)
+        tk.Button(
+            buttons,
+            text="Guardar",
+            command=self.save,
+            bg="#16a34a",
+            fg="white",
+            activebackground="#15803d",
+            activeforeground="white",
+            relief="flat",
+            padx=12,
+            pady=7,
+        ).pack(side="left")
+        tk.Button(
+            buttons,
+            text="Borrar",
+            command=self.delete_selected,
+            bg="#b91c1c",
+            fg="white",
+            activebackground="#991b1b",
+            activeforeground="white",
+            relief="flat",
+            padx=12,
+            pady=7,
+        ).pack(side="left", padx=(8, 0))
+        tk.Button(
+            buttons,
+            text="Recargar",
+            command=self.reload,
+            bg="#334155",
+            fg="white",
+            activebackground="#475569",
+            activeforeground="white",
+            relief="flat",
+            padx=12,
+            pady=7,
+        ).pack(side="left", padx=(8, 0))
+        tk.Button(
+            buttons,
+            text="Cerrar",
+            command=self.window.destroy,
+            bg="#1f2937",
+            fg="white",
+            activebackground="#374151",
+            activeforeground="white",
+            relief="flat",
+            padx=12,
+            pady=7,
+        ).pack(side="right")
+
+        list_frame = tk.Frame(self.window, bg="#020617")
+        list_frame.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+        self.listbox = tk.Listbox(
+            list_frame,
+            bg="#020617",
+            fg="#e5e7eb",
+            selectbackground="#16a34a",
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Consolas", 13),
+        )
+        self.listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = tk.Scrollbar(list_frame, command=self.listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.listbox.configure(yscrollcommand=scrollbar.set)
+        self.listbox.bind("<<ListboxSelect>>", self._on_select)
+
+        tk.Label(
+            self.window,
+            textvariable=self.status_var,
+            bg="#0f172a",
+            fg="#cbd5e1",
+            font=("Segoe UI", 10),
+            wraplength=510,
+            justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 16))
+
+    def reload(self):
+        self.rows = list_access_plates()
+        self.listbox.delete(0, tk.END)
+        for plate, message in self.rows:
+            suffix = f" | {message.upper()}" if message else ""
+            self.listbox.insert(tk.END, f"{plate:<8}{suffix}")
+        self.status_var.set(f"{len(self.rows)} patente(s) autorizada(s).")
+
+    def save(self):
+        try:
+            plate = upsert_access_plate(self.plate_var.get(), self.message_var.get())
+        except ValueError as exc:
+            messagebox.showwarning(APP_NAME, str(exc), parent=self.window)
+            return
+        self.reload()
+        self._select_plate(plate)
+        self.status_var.set(f"{plate} guardada para dar acceso.")
+
+    def delete_selected(self):
+        plate = self._current_plate() or normalize_db_plate(self.plate_var.get())
+        if not plate:
+            messagebox.showwarning(APP_NAME, "Selecciona o escribe una patente para borrar.", parent=self.window)
+            return
+        if not messagebox.askyesno(APP_NAME, f"Borrar {plate} de la lista de acceso?", parent=self.window):
+            return
+        delete_access_plate(plate)
+        self.plate_var.set("")
+        self.message_var.set("")
+        self.reload()
+        self.status_var.set(f"{plate} borrada de la lista de acceso.")
+
+    def _on_select(self, _event=None):
+        index = self._selected_index()
+        if index is None:
+            return
+        plate, message = self.rows[index]
+        self.plate_var.set(plate)
+        self.message_var.set(message)
+
+    def _selected_index(self):
+        selection = self.listbox.curselection()
+        if not selection:
+            return None
+        index = int(selection[0])
+        return index if 0 <= index < len(self.rows) else None
+
+    def _current_plate(self):
+        index = self._selected_index()
+        if index is None:
+            return ""
+        return self.rows[index][0]
+
+    def _select_plate(self, plate):
+        for index, row in enumerate(self.rows):
+            if row[0] == plate:
+                self.listbox.selection_clear(0, tk.END)
+                self.listbox.selection_set(index)
+                self.listbox.see(index)
+                return
 
 
 class CameraReader(threading.Thread):
@@ -295,6 +571,7 @@ class PlateReaderApp:
         self.current_candidates = []
         self.confirmed_plate = ""
         self.confirmed_rut = ""
+        self.access_overlay = None
         self.selecting_polygon = False
         self.pending_polygon = []
         self.display_info = None
@@ -304,6 +581,7 @@ class PlateReaderApp:
         self.root.geometry("1180x760")
         self.root.configure(bg="#0f172a")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        ensure_access_table()
 
         self._build_ui()
         self._start_workers()
@@ -414,9 +692,24 @@ class PlateReaderApp:
             pady=6,
         ).pack(side="left", padx=(8, 0))
 
+        button_row3 = tk.Frame(panel, bg="#111827")
+        button_row3.pack(fill="x", pady=(0, 12))
+        tk.Button(
+            button_row3,
+            text="Lista acceso",
+            command=self.open_access_dialog,
+            bg="#16a34a",
+            fg="white",
+            activebackground="#15803d",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+            pady=6,
+        ).pack(side="left")
+
         help_text = (
             "Modo estricto: define una zona poligonal para leer solo donde esta la patente. "
-            "Al confirmar, copia la patente al portapapeles."
+            "Al confirmar, copia la patente y muestra acceso autorizado o denegado."
         )
         tk.Label(panel, text=help_text, bg="#111827", fg="#94a3b8", font=("Segoe UI", 9), wraplength=290, justify="left").pack(
             anchor="w", side="bottom"
@@ -436,6 +729,9 @@ class PlateReaderApp:
     def force_ocr(self):
         if self.latest_frame is not None:
             self._queue_ocr(self.latest_frame.copy())
+
+    def open_access_dialog(self):
+        AccessListDialog(self.root)
 
     def start_polygon_selection(self):
         self.selecting_polygon = True
@@ -689,6 +985,8 @@ class PlateReaderApp:
         best, votes = ranked[0]
         second_votes = ranked[1][1] if len(ranked) > 1 else 0
         vote_margin = votes - second_votes
+        if self.confirmed_plate == best:
+            return
         if votes >= int(self.config["min_confirm_votes"]):
             if vote_margin < int(self.config["min_vote_margin"]):
                 self.status_value.configure(text=f"Lectura ambigua: {best} compite con otra patente. No se copia.")
@@ -714,6 +1012,12 @@ class PlateReaderApp:
                 self.status_value.configure(text=f"Patente confirmada y copiada al portapapeles: {best}")
             else:
                 self.status_value.configure(text=f"Patente confirmada automaticamente: {best}")
+            access_record = get_access_record(best)
+            if access_record:
+                _stored_plate, access_message = access_record
+                self._show_access_overlay(best, True, access_message)
+            else:
+                self._show_access_overlay(best, False, self.config.get("denied_message", ""))
         elif not self.confirmed_plate:
             self.plate_value.configure(text=best)
             self.rut_value.configure(text=f"Leyendo... {votes}/{self.config['min_confirm_votes']}")
@@ -722,6 +1026,100 @@ class PlateReaderApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.root.update()
+
+    def _play_access_sound(self, allowed):
+        def play():
+            try:
+                if allowed:
+                    winsound.Beep(1200, 180)
+                    time.sleep(0.05)
+                    winsound.Beep(1500, 180)
+                else:
+                    winsound.Beep(520, 260)
+                    time.sleep(0.05)
+                    winsound.Beep(420, 260)
+            except Exception:
+                try:
+                    winsound.MessageBeep(winsound.MB_ICONASTERISK if allowed else winsound.MB_ICONHAND)
+                except Exception:
+                    pass
+
+        threading.Thread(target=play, daemon=True).start()
+
+    def _show_access_overlay(self, plate, allowed, message=""):
+        if self.access_overlay is not None:
+            try:
+                self.access_overlay.destroy()
+            except tk.TclError:
+                pass
+            self.access_overlay = None
+
+        bg = "#16a34a" if allowed else "#b91c1c"
+        title = "LA PATENTE REGISTRADA\nY DAR ACCESO" if allowed else "ACCESO DENEGADO"
+        detail = f"PATENTE: {normalize_db_plate(plate)}"
+        message = (message or "").strip().upper()
+        seconds = max(2.5, float(self.config.get("access_overlay_seconds", 2.5)))
+
+        overlay = tk.Toplevel(self.root)
+        self.access_overlay = overlay
+        overlay.configure(bg=bg)
+        overlay.overrideredirect(True)
+        overlay.attributes("-fullscreen", True)
+        overlay.attributes("-topmost", True)
+        overlay.lift()
+        overlay.focus_force()
+        overlay.bind("<Escape>", lambda _event: close_overlay())
+
+        content = tk.Frame(overlay, bg=bg)
+        content.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(
+            content,
+            text=title,
+            bg=bg,
+            fg="white",
+            font=("Segoe UI", 68, "bold"),
+            justify="center",
+        ).pack(padx=36, pady=(0, 24))
+        tk.Label(
+            content,
+            text=detail,
+            bg=bg,
+            fg="white",
+            font=("Segoe UI", 46, "bold"),
+            justify="center",
+        ).pack(padx=36, pady=(0, 18))
+        if message:
+            tk.Label(
+                content,
+                text=message,
+                bg=bg,
+                fg="white",
+                font=("Segoe UI", 30, "bold"),
+                justify="center",
+                wraplength=1100,
+            ).pack(padx=36)
+
+        def keep_on_top():
+            if self.access_overlay is overlay:
+                try:
+                    overlay.attributes("-topmost", True)
+                    overlay.lift()
+                except tk.TclError:
+                    return
+                overlay.after(250, keep_on_top)
+
+        def close_overlay():
+            if self.access_overlay is overlay:
+                self.access_overlay = None
+            try:
+                overlay.destroy()
+            except tk.TclError:
+                pass
+
+        self._play_access_sound(allowed)
+        overlay.after(50, keep_on_top)
+        overlay.after(int(seconds * 1000), close_overlay)
 
     def _update_reads_list(self):
         self.reads_list.delete(0, tk.END)
