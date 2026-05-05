@@ -575,11 +575,9 @@ class FloatingApp:
             rut = self.db.random_rut()
             if not rut:
                 self._flash("SIN", "#dc2626")
-                Win32.user32.MessageBeep(0xFFFFFFFF)
                 return
             Clipboard.set_text(rut)
             self._flash("RND", "#7c3aed")
-            Win32.user32.MessageBeep(0xFFFFFFFF)
         except Exception as exc:
             self._flash("ERR", "#dc2626")
             messagebox.showerror(APP_NAME, str(exc))
