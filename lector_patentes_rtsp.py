@@ -35,6 +35,8 @@ DEFAULT_CONFIG = {
     "plate_polygon": [],
     "vehicle_roi": [0.0, 0.0, 1.0, 1.0],
     "ocr_interval_seconds": 0.12,
+    "idle_scan_enabled": True,
+    "idle_ocr_interval_seconds": 0.6,
     "always_scan": False,
     "auto_read_on_vehicle": True,
     "motion_enabled": True,
@@ -1091,9 +1093,8 @@ class PlateReaderApp:
         self.current_candidates = []
         self.confirmed_plate = ""
         self.confirmed_rut = ""
-        self.provisional_plate = ""
         self.confirmed_at = 0
-        if self.config["clear_clipboard_on_vehicle_start"]:
+        if self.config["clear_clipboard_on_vehicle_start"] and not self.provisional_plate:
             self._copy_to_clipboard("")
         self.plate_value.configure(text="Leyendo")
         self.rut_value.configure(text="Vehiculo detectado")
@@ -1106,9 +1107,6 @@ class PlateReaderApp:
         if self.latest_frame is None:
             return
         now = time.time()
-        interval = float(self.config["ocr_interval_seconds"])
-        if now - self.last_ocr_time < interval:
-            return
 
         automatic_window = (
             self.config["auto_read_on_vehicle"]
@@ -1116,8 +1114,21 @@ class PlateReaderApp:
             and now >= self.vehicle_started_at + float(self.config["read_after_motion_delay_seconds"])
             and now <= self.vehicle_read_until
         )
+        idle_window = (
+            bool(self.config.get("idle_scan_enabled", True))
+            and not self.vehicle_active
+            and now >= self.cooldown_until
+        )
 
-        if self.config["always_scan"] or automatic_window:
+        interval = (
+            float(self.config["ocr_interval_seconds"])
+            if automatic_window or self.config["always_scan"]
+            else float(self.config.get("idle_ocr_interval_seconds", 0.6))
+        )
+        if now - self.last_ocr_time < interval:
+            return
+
+        if self.config["always_scan"] or automatic_window or idle_window:
             self.last_ocr_time = now
             self._queue_ocr(self.latest_frame.copy())
         elif self.vehicle_active and now > self.vehicle_read_until:
@@ -1337,6 +1348,15 @@ class PlateReaderApp:
         )
         votes_ok = votes >= int(self.config["min_confirm_votes"]) and vote_margin >= int(self.config["min_vote_margin"])
         if self.confirmed_plate == best:
+            return
+        if not self.vehicle_active and not self.config["always_scan"]:
+            self.plate_value.configure(text=best)
+            score = float(best_stats["max_score"])
+            if self.config.get("copy_provisional_plate_to_clipboard", True) and best != self.provisional_plate:
+                self.provisional_plate = best
+                self._copy_to_clipboard(best)
+                self.status_value.configure(text=f"Prelectura copiada al portapapeles: {best}")
+            self.rut_value.configure(text=f"Preleyendo... {score:0.2f}")
             return
         if fast_single_ok or votes_ok:
             now = time.time()
