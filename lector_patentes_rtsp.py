@@ -40,13 +40,15 @@ DEFAULT_CONFIG = {
     "motion_threshold": 0.025,
     "read_after_motion_delay_seconds": 0.35,
     "reading_timeout_seconds": 10.0,
-    "confirmed_cooldown_seconds": 6.0,
+    "confirmed_cooldown_seconds": 1.0,
+    "restart_read_on_motion_after_confirm_seconds": 0.8,
     "recent_read_seconds": 8.0,
     "min_confirm_votes": 4,
     "min_vote_margin": 2,
     "min_ocr_score": 0.82,
-    "require_plate_in_database": True,
+    "require_plate_in_database": False,
     "copy_confirmed_plate_to_clipboard": True,
+    "clear_clipboard_on_vehicle_start": True,
     "max_frame_width": 1280,
     "open_timeout_ms": 5000,
     "read_timeout_ms": 5000,
@@ -534,8 +536,14 @@ class PlateReaderApp:
         if changed >= float(self.config["motion_threshold"]):
             now = time.time()
             self.last_motion_time = now
-            if self.config["auto_read_on_vehicle"] and now >= self.cooldown_until and not self.vehicle_active:
-                self._start_vehicle_read(now)
+            if self.config["auto_read_on_vehicle"] and not self.vehicle_active:
+                cooldown_ready = now >= self.cooldown_until
+                new_motion_after_confirm = (
+                    bool(self.confirmed_plate)
+                    and now - self.confirmed_at >= float(self.config["restart_read_on_motion_after_confirm_seconds"])
+                )
+                if cooldown_ready or new_motion_after_confirm:
+                    self._start_vehicle_read(now)
 
     def _start_vehicle_read(self, now):
         self.vehicle_active = True
@@ -547,6 +555,8 @@ class PlateReaderApp:
         self.confirmed_plate = ""
         self.confirmed_rut = ""
         self.confirmed_at = 0
+        if self.config["clear_clipboard_on_vehicle_start"]:
+            self._copy_to_clipboard("")
         self.plate_value.configure(text="Leyendo")
         self.rut_value.configure(text="Vehiculo detectado")
         self.status_value.configure(text="Vehiculo detectado. Leyendo patente automaticamente...")
@@ -576,6 +586,8 @@ class PlateReaderApp:
                 self.status_value.configure(text="No se confirmo patente. Esperando proximo vehiculo...")
                 self.plate_value.configure(text="---")
                 self.rut_value.configure(text="")
+                if self.config["clear_clipboard_on_vehicle_start"]:
+                    self._copy_to_clipboard("")
 
     def _queue_ocr(self, frame):
         try:
