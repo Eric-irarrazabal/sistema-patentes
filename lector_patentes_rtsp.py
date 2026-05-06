@@ -125,7 +125,7 @@ def load_config():
         return dict(DEFAULT_CONFIG)
 
     try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError:
         data = {}
 

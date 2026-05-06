@@ -54,7 +54,7 @@ def load_rtsp_url() -> str:
     if not CONFIG_PATH.exists():
         return ""
     try:
-        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError:
         return ""
     return str(config.get("rtsp_url") or "")
