@@ -63,7 +63,10 @@ DEFAULT_CONFIG = {
     "denied_message": "PATENTE EN LISTA DENEGADA",
     "max_frame_width": 1280,
     "open_timeout_ms": 5000,
-    "read_timeout_ms": 5000,
+    "read_timeout_ms": 1800,
+    "stream_stall_seconds": 2.0,
+    "duplicate_frame_stall_seconds": 1.2,
+    "post_motion_freeze_watch_seconds": 8.0,
 }
 
 
@@ -702,14 +705,26 @@ class AccessListDialog:
 
 
 class CameraReader(threading.Thread):
-    def __init__(self, rtsp_url, output_queue, stop_event, max_width, open_timeout_ms, read_timeout_ms):
+    def __init__(
+        self,
+        rtsp_url,
+        output_queue,
+        stop_event,
+        restart_event,
+        max_width,
+        open_timeout_ms,
+        read_timeout_ms,
+        stream_stall_seconds,
+    ):
         super().__init__(daemon=True)
         self.rtsp_url = rtsp_url
         self.output_queue = output_queue
         self.stop_event = stop_event
+        self.restart_event = restart_event
         self.max_width = max_width
         self.open_timeout_ms = open_timeout_ms
         self.read_timeout_ms = read_timeout_ms
+        self.stream_stall_seconds = stream_stall_seconds
 
     def run(self):
         if not self.rtsp_url:
@@ -719,7 +734,10 @@ class CameraReader(threading.Thread):
         # TCP suele ser mas estable con camaras IP que UDP.
         import os
 
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000|timeout;5000000"
+        timeout_us = max(1_000_000, int(self.read_timeout_ms) * 1000)
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+            f"rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|stimeout;{timeout_us}|timeout;{timeout_us}"
+        )
 
         while not self.stop_event.is_set():
             self.output_queue.put(("status", "Conectando camara..."))
@@ -741,17 +759,42 @@ class CameraReader(threading.Thread):
                 continue
 
             self.output_queue.put(("status", "Camara conectada"))
-            while not self.stop_event.is_set():
-                ok, frame = cap.read()
-                if not ok or frame is None:
+            read_queue = queue.Queue(maxsize=1)
+            session_stop = threading.Event()
+            threading.Thread(target=self._capture_loop, args=(cap, read_queue, session_stop), daemon=True).start()
+            last_frame_at = time.time()
+
+            while not self.stop_event.is_set() and not self.restart_event.is_set():
+                try:
+                    kind, payload = read_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if time.time() - last_frame_at >= self.stream_stall_seconds:
+                        self.output_queue.put(("status", "Camara sin frames nuevos. Reconectando..."))
+                        break
+                    continue
+
+                if kind != "frame":
                     self.output_queue.put(("status", "Se perdio video. Reintentando..."))
                     break
 
-                frame = self._resize(frame)
+                last_frame_at = time.time()
+                frame = self._resize(payload)
                 self._put_latest(("frame", frame))
 
+            session_stop.set()
+            self.restart_event.clear()
             cap.release()
             time.sleep(0.5)
+
+    def _capture_loop(self, cap, read_queue, session_stop):
+        while not self.stop_event.is_set() and not session_stop.is_set():
+            ok, frame = cap.read()
+            if session_stop.is_set():
+                break
+            if not ok or frame is None:
+                self._put_latest_to(read_queue, ("error", None))
+                break
+            self._put_latest_to(read_queue, ("frame", frame))
 
     def _port_is_reachable(self):
         parsed = urlparse(self.rtsp_url)
@@ -773,15 +816,19 @@ class CameraReader(threading.Thread):
         return cv2.resize(frame, (self.max_width, int(height * scale)), interpolation=cv2.INTER_AREA)
 
     def _put_latest(self, item):
+        self._put_latest_to(self.output_queue, item)
+
+    @staticmethod
+    def _put_latest_to(target_queue, item):
         try:
-            self.output_queue.put_nowait(item)
+            target_queue.put_nowait(item)
         except queue.Full:
             try:
-                self.output_queue.get_nowait()
+                target_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self.output_queue.put_nowait(item)
+                target_queue.put_nowait(item)
             except queue.Full:
                 pass
 
@@ -790,12 +837,16 @@ class PlateReaderApp:
     def __init__(self):
         self.config = load_config()
         self.stop_event = threading.Event()
+        self.camera_restart_event = threading.Event()
         self.frame_queue = queue.Queue(maxsize=4)
         self.ocr_queue = queue.Queue(maxsize=1)
         self.ocr = RapidOCR()
 
         self.latest_frame = None
+        self.latest_frame_at = 0
         self.latest_display = None
+        self.last_frame_signature = None
+        self.same_frame_started_at = 0
         self.last_gray = None
         self.last_motion_ratio = 0.0
         self.last_motion_time = 0
@@ -962,9 +1013,11 @@ class PlateReaderApp:
             self.config["rtsp_url"],
             self.frame_queue,
             self.stop_event,
+            self.camera_restart_event,
             int(self.config["max_frame_width"]),
             int(self.config["open_timeout_ms"]),
             int(self.config["read_timeout_ms"]),
+            float(self.config.get("stream_stall_seconds", 2.0)),
         ).start()
         threading.Thread(target=self._ocr_worker, daemon=True).start()
 
@@ -1033,11 +1086,18 @@ class PlateReaderApp:
         self.reads_list.delete(0, tk.END)
 
     def _tick(self):
-        self._drain_events()
-        self._maybe_queue_ocr()
-        self._drain_events()
-        self._render_frame()
-        self.root.after(33, self._tick)
+        try:
+            self._drain_events()
+            self._maybe_queue_ocr()
+            self._drain_events()
+            self._render_frame()
+        except Exception as exc:
+            try:
+                self.status_value.configure(text=f"Error recuperado en video: {exc}")
+            except Exception:
+                pass
+        finally:
+            self.root.after(33, self._tick)
 
     def _drain_events(self):
         while True:
@@ -1049,9 +1109,42 @@ class PlateReaderApp:
                 self.status_value.configure(text=payload)
             elif kind == "frame":
                 self.latest_frame = payload
+                self.latest_frame_at = time.time()
                 self._update_motion(payload)
+                self._watch_frozen_frame(payload)
             elif kind == "ocr_result":
                 self._handle_candidates(payload)
+
+    def _watch_frozen_frame(self, frame):
+        watch_seconds = float(self.config.get("post_motion_freeze_watch_seconds", 8.0))
+        watch_active = self.vehicle_active or (time.time() - self.last_motion_time <= watch_seconds)
+        if not watch_active:
+            self.last_frame_signature = None
+            self.same_frame_started_at = 0
+            return
+
+        signature = self._frame_signature(frame)
+        now = time.time()
+        if signature == self.last_frame_signature:
+            if self.same_frame_started_at == 0:
+                self.same_frame_started_at = now
+            elif now - self.same_frame_started_at >= float(self.config.get("duplicate_frame_stall_seconds", 1.2)):
+                self.status_value.configure(text="Camara congelada despues de movimiento. Reconectando...")
+                self.camera_restart_event.set()
+                self.last_frame_signature = None
+                self.same_frame_started_at = 0
+        else:
+            self.last_frame_signature = signature
+            self.same_frame_started_at = 0
+
+    @staticmethod
+    def _frame_signature(frame):
+        try:
+            small = cv2.resize(frame, (32, 18), interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            return gray.tobytes()
+        except Exception:
+            return None
 
     def _update_motion(self, frame):
         if not self.config["motion_enabled"]:
@@ -1164,11 +1257,15 @@ class PlateReaderApp:
                 except queue.Empty:
                     break
 
-            crop, offset = self._crop_roi(frame)
-            candidates = self._read_frame(crop, offset)
-            if candidates:
-                self.frame_queue.put(("status", f"OCR: {', '.join(c.text for c in candidates[:3])}"))
-            self.frame_queue.put(("ocr_result", candidates))
+            try:
+                crop, offset = self._crop_roi(frame)
+                candidates = self._read_frame(crop, offset)
+                if candidates:
+                    self.frame_queue.put(("status", f"OCR: {', '.join(c.text for c in candidates[:3])}"))
+                self.frame_queue.put(("ocr_result", candidates))
+            except Exception as exc:
+                self.frame_queue.put(("status", f"Error OCR recuperado: {exc}"))
+                self.frame_queue.put(("ocr_result", []))
 
     def _crop_roi(self, frame):
         polygon = self._get_plate_polygon()

@@ -32,5 +32,8 @@
   "denied_message": "PATENTE EN LISTA DENEGADA",
   "max_frame_width": 1280,
   "open_timeout_ms": 5000,
-  "read_timeout_ms": 5000
+  "read_timeout_ms": 1800,
+  "stream_stall_seconds": 2.0,
+  "duplicate_frame_stall_seconds": 1.2,
+  "post_motion_freeze_watch_seconds": 8.0
 }

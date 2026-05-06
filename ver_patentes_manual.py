@@ -1,6 +1,7 @@
 import ctypes
 import json
 import os
+import queue
 import sys
 import time
 import threading
@@ -16,15 +17,20 @@ from screeninfo import get_monitors
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "camera_config.json"
 WINDOW_NAME = "Camara Patentes"
-CTRL_HOLD_SECONDS = 1.0
+CTRL_HOLD_SECONDS = 0.05
 RECONNECT_DELAY_SECONDS = 2.0
-READ_SLEEP_SECONDS = 0.001
+READ_SLEEP_SECONDS = 0.0
+OPEN_TIMEOUT_MS = 1500
+READ_TIMEOUT_MS = 1200
+STREAM_STALL_SECONDS = 1.5
 SHOW_LOGS = True
 ERROR_ALREADY_EXISTS = 183
 _SINGLE_INSTANCE_MUTEX = None
 
-# RTSP por TCP para reducir artefactos/paquetes perdidos.
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+# RTSP por TCP en baja latencia para evitar leer segundos atrasados.
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    f"rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|stimeout;{READ_TIMEOUT_MS * 1000}|timeout;{READ_TIMEOUT_MS * 1000}"
+)
 
 
 # ============================================================
@@ -114,12 +120,40 @@ def is_usable_frame(frame) -> bool:
 
 
 def open_capture(rtsp_url: str):
-    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    cap = cv2.VideoCapture()
     try:
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, OPEN_TIMEOUT_MS)
+        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, READ_TIMEOUT_MS)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     except Exception:
         pass
+    cap.open(rtsp_url, cv2.CAP_FFMPEG)
     return cap
+
+
+def put_latest(target_queue, item) -> None:
+    try:
+        target_queue.put_nowait(item)
+    except queue.Full:
+        try:
+            target_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            target_queue.put_nowait(item)
+        except queue.Full:
+            pass
+
+
+def capture_loop(cap, read_queue, session_stop) -> None:
+    while not stop_event.is_set() and not session_stop.is_set():
+        ok, frame = cap.read()
+        if session_stop.is_set():
+            break
+        if not ok or frame is None:
+            put_latest(read_queue, ("error", None))
+            break
+        put_latest(read_queue, ("frame", frame))
 
 
 # ============================================================
@@ -146,16 +180,28 @@ def camera_worker(rtsp_url: str) -> None:
             continue
 
         log("[OK] Camara manual conectada.")
+        read_queue = queue.Queue(maxsize=1)
+        session_stop = threading.Event()
+        threading.Thread(target=capture_loop, args=(cap, read_queue, session_stop), daemon=True).start()
+        last_seen_at = time.time()
 
         while not stop_event.is_set():
-            ok, frame = cap.read()
-            if not ok or frame is None:
+            try:
+                kind, frame = read_queue.get(timeout=0.05)
+            except queue.Empty:
+                if time.time() - last_seen_at >= STREAM_STALL_SECONDS:
+                    log("[WARN] Camara manual sin frames nuevos. Reconectando...")
+                    break
+                continue
+
+            if kind != "frame" or frame is None:
                 log("[WARN] Error leyendo frame manual. Reconectando...")
                 break
 
             if not is_usable_frame(frame):
                 continue
 
+            last_seen_at = time.time()
             with frame_lock:
                 last_frame = frame.copy()
                 last_frame_ts = time.time()
@@ -164,6 +210,7 @@ def camera_worker(rtsp_url: str) -> None:
                 time.sleep(READ_SLEEP_SECONDS)
 
         try:
+            session_stop.set()
             cap.release()
         except Exception:
             pass
@@ -218,7 +265,7 @@ def main() -> None:
     frozen = None
     frozen_ts = 0.0
 
-    log("[INFO] Manten CTRL por 1 segundo para abrir la imagen congelada.")
+    log("[INFO] Presiona CTRL para abrir la imagen de ese momento.")
     log("[INFO] Suelta CTRL para cerrar. ESC para salir del modo manual.")
 
     while True:
