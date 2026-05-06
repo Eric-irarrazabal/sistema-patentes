@@ -5,7 +5,7 @@
   "vehicle_roi": [0.0, 0.0, 1.0, 1.0],
   "ocr_interval_seconds": 0.12,
   "idle_scan_enabled": true,
-  "idle_ocr_interval_seconds": 0.6,
+  "idle_ocr_interval_seconds": 0.35,
   "always_scan": false,
   "auto_read_on_vehicle": true,
   "motion_enabled": true,

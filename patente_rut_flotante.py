@@ -126,12 +126,12 @@ class PlateRutDatabase:
                 return candidate, rut
         return None, None
 
-    def random_rut(self):
+    def random_patente(self):
         rows = self.conn.execute(
             """
-            SELECT DISTINCT rut
+            SELECT DISTINCT patente
             FROM patente_rut
-            WHERE rut IS NOT NULL AND rut <> ''
+            WHERE patente IS NOT NULL AND patente <> ''
             """
         ).fetchall()
         if not rows:
@@ -567,17 +567,17 @@ class FloatingApp:
     def _on_saved_mapping(self, patente, rut):
         self._flash("+OK", "#2563eb")
 
-    def copy_random_rut(self):
+    def copy_random_patente(self):
         if self.busy:
             return
         self.busy = True
         try:
-            rut = self.db.random_rut()
-            if not rut:
+            patente = self.db.random_patente()
+            if not patente:
                 self._flash("SIN", "#dc2626")
                 return
-            Clipboard.set_text(rut)
-            self._flash("RND", "#7c3aed")
+            Clipboard.set_text(patente)
+            self._flash("PAT", "#7c3aed")
         except Exception as exc:
             self._flash("ERR", "#dc2626")
             messagebox.showerror(APP_NAME, str(exc))
@@ -601,7 +601,7 @@ class FloatingApp:
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Convertir patente a RUT  Flecha derecha", command=self.convert_active_patente)
         menu.add_command(label="Agregar / actualizar  Ctrl+Shift+G", command=self.open_add_dialog)
-        menu.add_command(label="Copiar RUT aleatorio  Ctrl x2", command=self.copy_random_rut)
+        menu.add_command(label="Copiar patente aleatoria  Ctrl x3", command=self.copy_random_patente)
         menu.add_separator()
         menu.add_command(label="Volver a posicion inicial", command=self._reset_position)
         menu.add_command(label="Salir", command=self.close)
@@ -659,12 +659,12 @@ class FloatingApp:
                     time.sleep(0.018)
                     continue
                 if down and not last_down:
-                    self.ctrl_taps = [tap for tap in self.ctrl_taps if now - tap <= 0.75]
+                    self.ctrl_taps = [tap for tap in self.ctrl_taps if now - tap <= 1.05]
                     self.ctrl_taps.append(now)
-                    if len(self.ctrl_taps) >= 2:
+                    if len(self.ctrl_taps) >= 3:
                         self.ctrl_taps.clear()
-                        self.root.after(0, self.copy_random_rut)
-                        time.sleep(0.45)
+                        self.root.after(0, self.copy_random_patente)
+                        time.sleep(0.35)
                 last_down = down
                 time.sleep(0.018)
 
@@ -783,7 +783,7 @@ def run_self_tests():
         assert db.lookup_patente("abcd12") == "12345678K"
         assert db.lookup_text("ABCD12")[1] == "12345678K"
         assert db.lookup_text("ABCD12 12345678K")[1] == "12345678K"
-        assert db.random_rut() == "12345678K"
+        assert db.random_patente() == "ABCD12"
         db.close()
 
 

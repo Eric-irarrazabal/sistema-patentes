@@ -36,7 +36,7 @@ DEFAULT_CONFIG = {
     "vehicle_roi": [0.0, 0.0, 1.0, 1.0],
     "ocr_interval_seconds": 0.12,
     "idle_scan_enabled": True,
-    "idle_ocr_interval_seconds": 0.6,
+    "idle_ocr_interval_seconds": 0.35,
     "always_scan": False,
     "auto_read_on_vehicle": True,
     "motion_enabled": True,
@@ -811,6 +811,8 @@ class PlateReaderApp:
         self.confirmed_rut = ""
         self.provisional_plate = ""
         self.access_overlay = None
+        self.last_rule_alert_key = ""
+        self.last_rule_alert_at = 0
         self.known_plates = set()
         self.known_plates_loaded_at = 0
         self.selecting_polygon = False
@@ -1300,6 +1302,24 @@ class PlateReaderApp:
         )
         return float(candidate.score or 0.0) >= threshold
 
+    def _show_rule_overlay_if_listed(self, plate, force=False):
+        access_record = get_access_record(plate)
+        denied_record = None if access_record else get_denied_record(plate)
+        if not access_record and not denied_record:
+            return False
+
+        allowed = bool(access_record)
+        message = access_record[1] if access_record else (denied_record[1] or self.config.get("denied_message", ""))
+        key = f"{'A' if allowed else 'D'}:{normalize_db_plate(plate)}"
+        now = time.time()
+        if not force and key == self.last_rule_alert_key and now - self.last_rule_alert_at < 4.0:
+            return True
+
+        self.last_rule_alert_key = key
+        self.last_rule_alert_at = now
+        self._show_access_overlay(plate, allowed, message)
+        return True
+
     def _handle_candidates(self, candidates):
         now = time.time()
         self.current_candidates = candidates
@@ -1356,6 +1376,8 @@ class PlateReaderApp:
                 self.provisional_plate = best
                 self._copy_to_clipboard(best)
                 self.status_value.configure(text=f"Prelectura copiada al portapapeles: {best}")
+            if self._show_rule_overlay_if_listed(best):
+                self.status_value.configure(text=f"Prelectura con regla aplicada: {best}")
             self.rut_value.configure(text=f"Preleyendo... {score:0.2f}")
             return
         if fast_single_ok or votes_ok:
@@ -1380,21 +1402,8 @@ class PlateReaderApp:
                 self.status_value.configure(text=f"Patente confirmada y copiada al portapapeles: {best}")
             else:
                 self.status_value.configure(text=f"Patente confirmada automaticamente: {best}")
-            access_record = get_access_record(best)
-            if access_record:
-                _stored_plate, access_message = access_record
-                self._show_access_overlay(best, True, access_message)
-            else:
-                denied_record = get_denied_record(best)
-                if denied_record:
-                    _stored_plate, denied_message = denied_record
-                    self._show_access_overlay(
-                        best,
-                        False,
-                        denied_message or self.config.get("denied_message", ""),
-                    )
-                else:
-                    self.status_value.configure(text=f"Patente copiada sin regla de acceso/denegado: {best}")
+            if not self._show_rule_overlay_if_listed(best, force=True):
+                self.status_value.configure(text=f"Patente copiada sin regla de acceso/denegado: {best}")
         elif votes >= int(self.config["min_confirm_votes"]) and vote_margin < int(self.config["min_vote_margin"]):
             self.status_value.configure(text=f"Lectura ambigua: {best} compite con otra patente. No se copia.")
         elif not self.confirmed_plate:
@@ -1404,6 +1413,8 @@ class PlateReaderApp:
                 self.provisional_plate = best
                 self._copy_to_clipboard(best)
                 self.status_value.configure(text=f"Patente provisional copiada al portapapeles: {best}")
+            if self._show_rule_overlay_if_listed(best):
+                self.status_value.configure(text=f"Patente provisional con regla aplicada: {best}")
             self.rut_value.configure(text=f"Leyendo... {votes}/{self.config['min_confirm_votes']} ({score:0.2f})")
 
     def _copy_to_clipboard(self, text):
