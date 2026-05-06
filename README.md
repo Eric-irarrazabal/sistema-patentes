@@ -28,7 +28,7 @@ Si guardas una patente que ya existe, se actualiza el RUT.
 
 ## Posicion
 
-La barra aparece cerca del sector marcado en la imagen. Para moverla, mantén `Alt` y arrastra con el mouse. La posicion se guarda en `config.json`.
+La barra aparece cerca del sector marcado en la imagen. Para moverla, manten `Alt` y arrastra con el mouse. La posicion se guarda en `config.json`.
 
 Click derecho sobre la barra muestra opciones para convertir, agregar, volver a la posicion inicial o salir.
 
@@ -51,6 +51,8 @@ Uso:
 
 Cuando una patente autorizada se confirma, aparece una pantalla completa verde durante al menos 2.5 segundos con la patente y el mensaje. Si esta en la lista de denegados, aparece una pantalla completa roja con acceso denegado. En ambos casos se emite un bip y la patente confirmada queda copiada al portapapeles. Si no esta en ninguna lista, solo queda copiada.
 
+La lectura usa `plate_detector.onnx`, un detector YOLO entrenado con fotos de esta camara, para ubicar primero la patente y luego pasar solo ese recorte al OCR. Si el modelo no esta junto al EXE, el lector vuelve automaticamente al recorte ROI anterior.
+
 La lectura prioriza rapidez y precision: procesa siempre el cuadro mas reciente, prepara la imagen de la zona de patente antes del OCR, descarta candidatos debiles y puede confirmar en una sola lectura cuando la confianza es alta o cuando calza con una patente ya registrada. Mientras no hay auto escanea suave cada 0.35 segundos; si ve algo parecido a patente, lo copia como provisional. En `1/2`, copia una patente provisional al portapapeles; cuando confirma, reemplaza por la definitiva. Si la patente provisional ya esta en acceso o denegado, muestra la pantalla correspondiente de inmediato.
 
 Si la camara no conecta, verifica que este PC este en la misma red que la camara y que el puerto RTSP `554` responda.
@@ -64,6 +66,8 @@ El lanzador `IniciarSistemaPatentes.exe` abre juntos:
 - `VerPatentesManual.exe`
 
 Para reconstruir todo usa `crear_ejecutables_completos.bat`.
+
+Al moverlo a otro PC, copia tambien `plate_detector.onnx` junto a `LectorPatentesRTSP.exe`.
 
 ## Modo Manual
 

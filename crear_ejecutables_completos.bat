@@ -6,7 +6,7 @@ pyinstaller --noconsole --onefile --name PatenteRUTFlotante patente_rut_flotante
 
 echo.
 echo Creando LectorPatentesRTSP.exe...
-".venv-placas\Scripts\pyinstaller.exe" --noconsole --onefile --collect-data rapidocr_onnxruntime --name LectorPatentesRTSP lector_patentes_rtsp.py
+".venv-placas\Scripts\pyinstaller.exe" --noconsole --onefile --collect-data rapidocr_onnxruntime --exclude-module ultralytics --exclude-module torch --exclude-module torchvision --exclude-module matplotlib --exclude-module scipy --exclude-module onnx --exclude-module onnxslim --exclude-module polars --name LectorPatentesRTSP lector_patentes_rtsp.py
 
 echo.
 echo Creando VerPatentesManual.exe...
@@ -18,6 +18,7 @@ pyinstaller --noconsole --onefile --name IniciarSistemaPatentes iniciar_sistema_
 
 copy /Y patentes_rut.sqlite3 dist\patentes_rut.sqlite3 >nul
 copy /Y camera_config.json dist\camera_config.json >nul
+copy /Y plate_detector.onnx dist\plate_detector.onnx >nul
 
 echo.
 echo Listo. Abre:

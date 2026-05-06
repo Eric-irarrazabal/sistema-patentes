@@ -31,7 +31,7 @@ _SINGLE_INSTANCE_MUTEX = None
 
 DEFAULT_CONFIG = {
     "rtsp_url": "",
-    "roi": [0.0, 0.0, 1.0, 1.0],
+    "roi": [0.0, 0.25, 1.0, 0.92],
     "plate_polygon": [],
     "vehicle_roi": [0.0, 0.0, 1.0, 1.0],
     "ocr_interval_seconds": 0.12,
@@ -48,12 +48,22 @@ DEFAULT_CONFIG = {
     "recent_read_seconds": 2.0,
     "min_confirm_votes": 2,
     "min_vote_margin": 1,
-    "min_ocr_score": 0.80,
+    "min_ocr_score": 0.70,
     "fast_single_read_score": 0.93,
     "known_plate_single_read_score": 0.80,
+    "early_return_candidate_score": 0.75,
+    "plate_detector_enabled": True,
+    "plate_detector_path": "plate_detector.onnx",
+    "plate_detector_confidence": 0.25,
+    "plate_detector_nms_threshold": 0.45,
+    "plate_detector_input_size": 640,
+    "plate_detector_padding": 0.18,
     "max_candidates_per_frame": 2,
     "ocr_preprocess_variants": 1,
     "ocr_target_width": 760,
+    "partial_reread_enabled": True,
+    "partial_reread_min_score": 0.55,
+    "partial_reread_target_width": 540,
     "known_plate_refresh_seconds": 2.0,
     "require_plate_in_database": False,
     "copy_confirmed_plate_to_clipboard": True,
@@ -117,6 +127,129 @@ class OcrCandidate:
     box: list
 
 
+@dataclass
+class PlateDetection:
+    box: tuple
+    score: float
+
+
+def resolve_app_path(value):
+    path = Path(value or "")
+    if path.is_absolute():
+        return path
+
+    candidates = [APP_DIR / path, Path(__file__).resolve().parent / path, Path.cwd() / path]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+class PlateYoloDetector:
+    def __init__(self, config):
+        self.enabled = bool(config.get("plate_detector_enabled", True))
+        self.net = None
+        self.error = ""
+        self.input_size = int(config.get("plate_detector_input_size", 640))
+        self.confidence = float(config.get("plate_detector_confidence", 0.25))
+        self.nms_threshold = float(config.get("plate_detector_nms_threshold", 0.45))
+        self.padding = float(config.get("plate_detector_padding", 0.18))
+        self.path = resolve_app_path(config.get("plate_detector_path", "plate_detector.onnx"))
+
+        if not self.enabled:
+            return
+        if not self.path.exists():
+            self.error = f"Modelo YOLO no encontrado: {self.path}"
+            return
+        try:
+            self.net = cv2.dnn.readNetFromONNX(str(self.path))
+        except Exception as exc:
+            self.error = f"No se pudo cargar YOLO: {exc}"
+
+    def detect(self, image):
+        if self.net is None or image is None or image.size == 0:
+            return None
+
+        height, width = image.shape[:2]
+        letterboxed, ratio, pad_x, pad_y = self._letterbox(image)
+        blob = cv2.dnn.blobFromImage(
+            letterboxed,
+            1 / 255.0,
+            (self.input_size, self.input_size),
+            swapRB=True,
+            crop=False,
+        )
+        self.net.setInput(blob)
+        try:
+            output = self.net.forward()
+        except Exception as exc:
+            self.error = f"Error YOLO: {exc}"
+            return None
+
+        rows = self._iter_output_rows(output)
+        boxes = []
+        scores = []
+        for row in rows:
+            if row.shape[0] < 5:
+                continue
+            score = float(row[4]) if row.shape[0] == 5 else float(np.max(row[4:]))
+            if score < self.confidence:
+                continue
+
+            center_x, center_y, box_w, box_h = [float(value) for value in row[:4]]
+            x1 = (center_x - box_w / 2 - pad_x) / ratio
+            y1 = (center_y - box_h / 2 - pad_y) / ratio
+            x2 = (center_x + box_w / 2 - pad_x) / ratio
+            y2 = (center_y + box_h / 2 - pad_y) / ratio
+            x1, y1, x2, y2 = self._expand_box(x1, y1, x2, y2, width, height)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            boxes.append([int(x1), int(y1), int(x2 - x1), int(y2 - y1)])
+            scores.append(score)
+
+        if not boxes:
+            return None
+
+        selected = cv2.dnn.NMSBoxes(boxes, scores, self.confidence, self.nms_threshold)
+        if len(selected) == 0:
+            return None
+        indexes = np.array(selected).reshape(-1)
+        best_index = max(indexes, key=lambda index: scores[int(index)])
+        x, y, box_w, box_h = boxes[int(best_index)]
+        return PlateDetection((x, y, x + box_w, y + box_h), scores[int(best_index)])
+
+    def _letterbox(self, image):
+        height, width = image.shape[:2]
+        ratio = min(self.input_size / width, self.input_size / height)
+        new_w = int(round(width * ratio))
+        new_h = int(round(height * ratio))
+        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        canvas = np.full((self.input_size, self.input_size, 3), 114, dtype=np.uint8)
+        pad_x = (self.input_size - new_w) / 2
+        pad_y = (self.input_size - new_h) / 2
+        canvas[int(pad_y) : int(pad_y) + new_h, int(pad_x) : int(pad_x) + new_w] = resized
+        return canvas, ratio, pad_x, pad_y
+
+    @staticmethod
+    def _iter_output_rows(output):
+        output = np.squeeze(output)
+        if output.ndim != 2:
+            return []
+        if output.shape[0] < output.shape[1]:
+            output = output.T
+        return output
+
+    def _expand_box(self, x1, y1, x2, y2, width, height):
+        pad_x = (x2 - x1) * self.padding
+        pad_y = (y2 - y1) * self.padding
+        return (
+            max(0, int(x1 - pad_x)),
+            max(0, int(y1 - pad_y)),
+            min(width - 1, int(x2 + pad_x)),
+            min(height - 1, int(y2 + pad_y)),
+        )
+
+
 def load_config():
     if not CONFIG_PATH.exists():
         CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2), encoding="utf-8")
@@ -134,6 +267,10 @@ def load_config():
 
 def normalize_plate_text(value):
     return re.sub(r"[^A-Z0-9]", "", (value or "").upper())
+
+
+def count_plate_letters(value):
+    return sum(1 for char in value if char.isalpha())
 
 
 def looks_like_plate(value):
@@ -208,6 +345,8 @@ def positional_plate_variants(value):
 def extract_plate_candidates(text, score, box, known_plates=None):
     raw = normalize_plate_text(text)
     if not raw:
+        return []
+    if count_plate_letters(raw) < 2:
         return []
 
     candidates = []
@@ -794,9 +933,12 @@ class PlateReaderApp:
         self.frame_queue = queue.Queue(maxsize=4)
         self.ocr_queue = queue.Queue(maxsize=1)
         self.ocr = RapidOCR()
+        self.plate_detector = PlateYoloDetector(self.config)
 
         self.latest_frame = None
         self.latest_display = None
+        self.last_plate_detector_box = None
+        self.last_plate_detector_score = 0.0
         self.last_gray = None
         self.last_motion_ratio = 0.0
         self.last_motion_time = 0
@@ -1185,8 +1327,21 @@ class PlateReaderApp:
     def _crop_roi(self, frame):
         polygon = self._get_plate_polygon()
         if polygon:
-            return self._crop_polygon(frame, polygon)
-        return self._crop_configured_roi(frame, self.config["roi"])
+            crop, offset = self._crop_polygon(frame, polygon)
+        else:
+            crop, offset = self._crop_configured_roi(frame, self.config["roi"])
+
+        detection = self.plate_detector.detect(crop)
+        if not detection:
+            self.last_plate_detector_box = None
+            self.last_plate_detector_score = 0.0
+            return crop, offset
+
+        x1, y1, x2, y2 = detection.box
+        ox, oy = offset
+        self.last_plate_detector_box = (x1 + ox, y1 + oy, x2 + ox, y2 + oy)
+        self.last_plate_detector_score = detection.score
+        return crop[y1:y2, x1:x2], (x1 + ox, y1 + oy)
 
     def _get_plate_polygon(self):
         polygon = self.config.get("plate_polygon") or []
@@ -1274,11 +1429,78 @@ class PlateReaderApp:
 
         return variants
 
+    def _should_reread_partial_text(self, raw, score):
+        if not self.config.get("partial_reread_enabled", True):
+            return False
+        if float(score or 0.0) < float(self.config.get("partial_reread_min_score", 0.55)):
+            return False
+        if not 4 <= len(raw) <= 7:
+            return False
+        if sum(1 for char in raw if char.isdigit()) < 1:
+            return False
+        return count_plate_letters(raw) >= 1
+
+    def _reread_partial_box(self, image, box):
+        points = np.array(box, dtype=np.float32).astype(np.int32)
+        x, y, width, height = cv2.boundingRect(points)
+        if width <= 0 or height <= 0:
+            return [], (0, 0), 1.0
+
+        pad_x = max(18, int(width * 0.8))
+        pad_y = max(14, int(height * 1.2))
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(image.shape[1], x + width + pad_x)
+        y2 = min(image.shape[0], y + height + pad_y)
+        subimage = image[y1:y2, x1:x2]
+        if subimage.size == 0:
+            return [], (x1, y1), 1.0
+
+        target_width = max(220, int(self.config.get("partial_reread_target_width", 360)))
+        reread_scale = 1.0
+        if subimage.shape[1] < target_width:
+            reread_scale = min(4.0, target_width / max(1, subimage.shape[1]))
+            subimage = cv2.resize(
+                subimage,
+                (int(subimage.shape[1] * reread_scale), int(subimage.shape[0] * reread_scale)),
+                interpolation=cv2.INTER_CUBIC,
+            )
+
+        try:
+            results, _elapsed = self.ocr(subimage)
+        except Exception as exc:
+            self.frame_queue.put(("status", f"Error OCR parcial: {exc}"))
+            return [], (x1, y1), reread_scale
+        return results or [], (x1, y1), reread_scale
+
     def _read_frame(self, crop, offset):
         known_plates = self._get_known_plates()
         candidate_map = {}
         ox, oy = offset
         for _name, image, scale in self._prepare_ocr_images(crop):
+            min_score = float(self.config["min_ocr_score"])
+            reread_keys = set()
+
+            def add_candidates(text, score, box, local_offset=(0, 0), local_scale=1.0):
+                if float(score or 0.0) < min_score:
+                    return False
+                lx, ly = local_offset
+                fixed_box = [
+                    [int((x / local_scale + lx) / scale + ox), int((y / local_scale + ly) / scale + oy)]
+                    for x, y in box
+                ]
+                added = False
+                for candidate in extract_plate_candidates(text, score, fixed_box, known_plates):
+                    if float(candidate.score or 0.0) < min_score:
+                        continue
+                    current = candidate_map.get(candidate.text)
+                    if current is None:
+                        candidate_map[candidate.text] = candidate
+                    else:
+                        current.score = min(0.99, max(current.score, candidate.score) + 0.03)
+                    added = True
+                return added
+
             try:
                 results, _elapsed = self.ocr(image)
             except Exception as exc:
@@ -1287,18 +1509,23 @@ class PlateReaderApp:
 
             for result in results or []:
                 box, text, score = result
-                if float(score or 0.0) < float(self.config["min_ocr_score"]):
-                    continue
-                fixed_box = [[int(x / scale + ox), int(y / scale + oy)] for x, y in box]
-                for candidate in extract_plate_candidates(text, score, fixed_box, known_plates):
-                    current = candidate_map.get(candidate.text)
-                    if current is None:
-                        candidate_map[candidate.text] = candidate
-                    else:
-                        current.score = min(0.99, max(current.score, candidate.score) + 0.03)
+                added = add_candidates(text, score, box)
+                raw = normalize_plate_text(text)
+                if not added and self._should_reread_partial_text(raw, score):
+                    rect = cv2.boundingRect(np.array(box, dtype=np.float32).astype(np.int32))
+                    key = (raw, rect)
+                    if key in reread_keys:
+                        continue
+                    reread_keys.add(key)
+                    reread_results, reread_offset, reread_scale = self._reread_partial_box(image, box)
+                    for reread_box, reread_text, reread_score in reread_results:
+                        add_candidates(reread_text, reread_score, reread_box, reread_offset, reread_scale)
 
             candidates = sorted(candidate_map.values(), key=lambda item: item.score, reverse=True)
-            if candidates and self._candidate_can_confirm_fast(candidates[0], known_plates):
+            if candidates and (
+                self._candidate_can_confirm_fast(candidates[0], known_plates)
+                or candidates[0].score >= float(self.config.get("early_return_candidate_score", 0.75))
+            ):
                 return candidates[:5]
 
         candidates = sorted(candidate_map.values(), key=lambda item: item.score, reverse=True)
@@ -1543,6 +1770,7 @@ class PlateReaderApp:
         self._draw_roi(frame)
         self._draw_plate_polygon(frame)
         self._draw_vehicle_roi(frame)
+        self._draw_plate_detector(frame)
         self._draw_candidates(frame)
         self._draw_banner(frame)
 
@@ -1625,6 +1853,22 @@ class PlateReaderApp:
             cv2.LINE_AA,
         )
 
+    def _draw_plate_detector(self, frame):
+        if not self.last_plate_detector_box:
+            return
+        x1, y1, x2, y2 = [int(value) for value in self.last_plate_detector_box]
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (250, 204, 21), 2)
+        cv2.putText(
+            frame,
+            f"YOLO {self.last_plate_detector_score:.2f}",
+            (x1, max(30, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (250, 204, 21),
+            2,
+            cv2.LINE_AA,
+        )
+
     def _draw_candidates(self, frame):
         for candidate in self.current_candidates:
             pts = np.array(candidate.box, dtype=np.int32)
@@ -1677,11 +1921,18 @@ def main():
 
 
 def run_self_test():
+    detector = PlateYoloDetector(DEFAULT_CONFIG)
+    if detector.path.exists() and detector.net is None:
+        raise AssertionError(detector.error or "No se pudo cargar plate_detector.onnx")
+
     assert looks_like_plate("ABCD12")
     assert looks_like_plate("ZY1234")
     assert positional_plate_variants("ABCD1Z")[0] == "ABCD12"
     assert extract_plate_candidates("ABCD12", 0.99, [])[0].text == "ABCD12"
     assert any(candidate.text == "ABCD12" for candidate in extract_plate_candidates("CHILEABCD12", 0.99, []))
+    assert not extract_plate_candidates("2026-05-06 08:16:01", 0.99, [])
+    assert extract_plate_candidates("S2-TZ-83", 0.78, [])[0].text == "SZTZ83"
+    assert extract_plate_candidates("HP.6452", 0.70, [])[0].text == "HP6452"
     corrected, corrected_score = correct_to_known_plate("ABCD1Z", 0.80, {"ABCD12"})
     assert corrected == "ABCD12"
     assert corrected_score > 0.80

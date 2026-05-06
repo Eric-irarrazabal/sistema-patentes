@@ -7,3 +7,9 @@ config.json
 camera_config.json
 .venv-placas/
 captures/
+sample_photos/
+sample_photos_yolo/
+yolo_dataset/
+runs/
+models/
+*.pt
