@@ -28,6 +28,7 @@
   "copy_confirmed_plate_to_clipboard": true,
   "copy_provisional_plate_to_clipboard": true,
   "clear_clipboard_on_vehicle_start": true,
+  "preserve_provisional_seconds": 1.2,
   "access_overlay_seconds": 2.5,
   "denied_message": "PATENTE EN LISTA DENEGADA",
   "max_frame_width": 1280,

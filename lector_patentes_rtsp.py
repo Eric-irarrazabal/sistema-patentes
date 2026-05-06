@@ -59,6 +59,7 @@ DEFAULT_CONFIG = {
     "copy_confirmed_plate_to_clipboard": True,
     "copy_provisional_plate_to_clipboard": True,
     "clear_clipboard_on_vehicle_start": True,
+    "preserve_provisional_seconds": 1.2,
     "access_overlay_seconds": 2.5,
     "denied_message": "PATENTE EN LISTA DENEGADA",
     "max_frame_width": 1280,
@@ -810,6 +811,7 @@ class PlateReaderApp:
         self.confirmed_plate = ""
         self.confirmed_rut = ""
         self.provisional_plate = ""
+        self.provisional_plate_at = 0
         self.access_overlay = None
         self.last_rule_alert_key = ""
         self.last_rule_alert_at = 0
@@ -1027,6 +1029,7 @@ class PlateReaderApp:
         self.confirmed_plate = ""
         self.confirmed_rut = ""
         self.provisional_plate = ""
+        self.provisional_plate_at = 0
         self.vehicle_active = False
         self.cooldown_until = 0
         self.confirmed_at = 0
@@ -1096,7 +1099,14 @@ class PlateReaderApp:
         self.confirmed_plate = ""
         self.confirmed_rut = ""
         self.confirmed_at = 0
-        if self.config["clear_clipboard_on_vehicle_start"] and not self.provisional_plate:
+        preserve_provisional = (
+            bool(self.provisional_plate)
+            and now - self.provisional_plate_at <= float(self.config.get("preserve_provisional_seconds", 1.2))
+        )
+        if not preserve_provisional:
+            self.provisional_plate = ""
+            self.provisional_plate_at = 0
+        if self.config["clear_clipboard_on_vehicle_start"] and not preserve_provisional:
             self._copy_to_clipboard("")
         self.plate_value.configure(text="Leyendo")
         self.rut_value.configure(text="Vehiculo detectado")
@@ -1374,6 +1384,7 @@ class PlateReaderApp:
             score = float(best_stats["max_score"])
             if self.config.get("copy_provisional_plate_to_clipboard", True) and best != self.provisional_plate:
                 self.provisional_plate = best
+                self.provisional_plate_at = now
                 self._copy_to_clipboard(best)
                 self.status_value.configure(text=f"Prelectura copiada al portapapeles: {best}")
             if self._show_rule_overlay_if_listed(best):
@@ -1391,6 +1402,7 @@ class PlateReaderApp:
 
             self.confirmed_plate = best
             self.provisional_plate = best
+            self.provisional_plate_at = now
             self.confirmed_at = now
             self.vehicle_active = False
             self.cooldown_until = now + float(self.config["confirmed_cooldown_seconds"])
@@ -1411,6 +1423,7 @@ class PlateReaderApp:
             score = float(best_stats["max_score"])
             if self.config.get("copy_provisional_plate_to_clipboard", True) and best != self.provisional_plate:
                 self.provisional_plate = best
+                self.provisional_plate_at = now
                 self._copy_to_clipboard(best)
                 self.status_value.configure(text=f"Patente provisional copiada al portapapeles: {best}")
             if self._show_rule_overlay_if_listed(best):
