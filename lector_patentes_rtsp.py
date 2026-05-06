@@ -71,6 +71,7 @@ DEFAULT_CONFIG = {
     "require_plate_in_database": False,
     "copy_confirmed_plate_to_clipboard": True,
     "copy_provisional_plate_to_clipboard": True,
+    "recopy_clipboard_interval_seconds": 0.6,
     "clear_clipboard_on_vehicle_start": True,
     "preserve_provisional_seconds": 1.2,
     "access_overlay_seconds": 2.5,
@@ -961,6 +962,8 @@ class PlateReaderApp:
         self.last_confirmed_at = 0
         self.provisional_plate = ""
         self.provisional_plate_at = 0
+        self.last_clipboard_plate = ""
+        self.last_clipboard_at = 0
         self.access_overlay = None
         self.last_rule_alert_key = ""
         self.last_rule_alert_at = 0
@@ -1187,6 +1190,8 @@ class PlateReaderApp:
         self.last_plate_detector_box = None
         self.last_plate_detector_score = 0.0
         self.last_plate_detector_seen_at = 0
+        self.last_clipboard_plate = ""
+        self.last_clipboard_at = 0
         self.plate_value.configure(text="---")
         self.rut_value.configure(text="")
         self.reads_list.delete(0, tk.END)
@@ -1656,11 +1661,11 @@ class PlateReaderApp:
         if not self.vehicle_active and not self.config["always_scan"]:
             self.plate_value.configure(text=best)
             score = float(best_stats["max_score"])
-            if self.config.get("copy_provisional_plate_to_clipboard", True) and best != self.provisional_plate:
+            if self.config.get("copy_provisional_plate_to_clipboard", True):
                 self.provisional_plate = best
                 self.provisional_plate_at = now
-                self._copy_to_clipboard(best)
-                self.status_value.configure(text=f"Prelectura copiada al portapapeles: {best}")
+                if self._copy_plate_to_clipboard(best):
+                    self.status_value.configure(text=f"Prelectura copiada al portapapeles: {best}")
             if self._show_rule_overlay_if_listed(best):
                 self.status_value.configure(text=f"Prelectura con regla aplicada: {best}")
             self.rut_value.configure(text=f"Preleyendo... {score:0.2f}")
@@ -1686,7 +1691,7 @@ class PlateReaderApp:
             self.plate_value.configure(text=best)
             self.rut_value.configure(text=self.confirmed_rut)
             if self.config["copy_confirmed_plate_to_clipboard"]:
-                self._copy_to_clipboard(best)
+                self._copy_plate_to_clipboard(best, force=True)
                 self.status_value.configure(text=f"Patente confirmada y copiada al portapapeles: {best}")
             else:
                 self.status_value.configure(text=f"Patente confirmada automaticamente: {best}")
@@ -1697,11 +1702,11 @@ class PlateReaderApp:
         elif not self.confirmed_plate:
             self.plate_value.configure(text=best)
             score = float(best_stats["max_score"])
-            if self.config.get("copy_provisional_plate_to_clipboard", True) and best != self.provisional_plate:
+            if self.config.get("copy_provisional_plate_to_clipboard", True):
                 self.provisional_plate = best
                 self.provisional_plate_at = now
-                self._copy_to_clipboard(best)
-                self.status_value.configure(text=f"Patente provisional copiada al portapapeles: {best}")
+                if self._copy_plate_to_clipboard(best):
+                    self.status_value.configure(text=f"Patente provisional copiada al portapapeles: {best}")
             if self._show_rule_overlay_if_listed(best):
                 self.status_value.configure(text=f"Patente provisional con regla aplicada: {best}")
             self.rut_value.configure(text=f"Leyendo... {votes}/{self.config['min_confirm_votes']} ({score:0.2f})")
@@ -1725,6 +1730,23 @@ class PlateReaderApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.root.update()
+        if text:
+            self.last_clipboard_plate = text
+            self.last_clipboard_at = time.time()
+        else:
+            self.last_clipboard_plate = ""
+            self.last_clipboard_at = 0
+
+    def _copy_plate_to_clipboard(self, plate, force=False):
+        plate = normalize_db_plate(plate)
+        if not plate:
+            return False
+        now = time.time()
+        interval = float(self.config.get("recopy_clipboard_interval_seconds", 0.6))
+        if not force and plate == self.last_clipboard_plate and now - self.last_clipboard_at < interval:
+            return False
+        self._copy_to_clipboard(plate)
+        return True
 
     def _play_access_sound(self, allowed):
         def play():

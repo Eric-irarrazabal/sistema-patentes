@@ -40,6 +40,7 @@
   "require_plate_in_database": false,
   "copy_confirmed_plate_to_clipboard": true,
   "copy_provisional_plate_to_clipboard": true,
+  "recopy_clipboard_interval_seconds": 0.6,
   "clear_clipboard_on_vehicle_start": true,
   "preserve_provisional_seconds": 1.2,
   "access_overlay_seconds": 2.5,
