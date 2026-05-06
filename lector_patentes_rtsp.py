@@ -45,6 +45,9 @@ DEFAULT_CONFIG = {
     "reading_timeout_seconds": 5.0,
     "confirmed_cooldown_seconds": 1.0,
     "restart_read_on_motion_after_confirm_seconds": 0.8,
+    "no_plate_read_timeout_seconds": 1.2,
+    "confirmed_display_seconds": 2.5,
+    "duplicate_plate_suppression_seconds": 3.0,
     "recent_read_seconds": 2.0,
     "min_confirm_votes": 2,
     "min_vote_margin": 1,
@@ -939,6 +942,8 @@ class PlateReaderApp:
         self.latest_display = None
         self.last_plate_detector_box = None
         self.last_plate_detector_score = 0.0
+        self.last_plate_detector_seen_at = 0
+        self.ocr_in_progress = False
         self.last_gray = None
         self.last_motion_ratio = 0.0
         self.last_motion_time = 0
@@ -952,6 +957,8 @@ class PlateReaderApp:
         self.current_candidates = []
         self.confirmed_plate = ""
         self.confirmed_rut = ""
+        self.last_confirmed_plate = ""
+        self.last_confirmed_at = 0
         self.provisional_plate = ""
         self.provisional_plate_at = 0
         self.access_overlay = None
@@ -1175,12 +1182,18 @@ class PlateReaderApp:
         self.vehicle_active = False
         self.cooldown_until = 0
         self.confirmed_at = 0
+        self.last_confirmed_plate = ""
+        self.last_confirmed_at = 0
+        self.last_plate_detector_box = None
+        self.last_plate_detector_score = 0.0
+        self.last_plate_detector_seen_at = 0
         self.plate_value.configure(text="---")
         self.rut_value.configure(text="")
         self.reads_list.delete(0, tk.END)
 
     def _tick(self):
         self._drain_events()
+        self._expire_confirmed_display()
         self._maybe_queue_ocr()
         self._drain_events()
         self._render_frame()
@@ -1236,6 +1249,8 @@ class PlateReaderApp:
         self.vehicle_started_at = now
         self.vehicle_read_until = now + float(self.config["reading_timeout_seconds"])
         self.last_ocr_time = 0
+        self.last_plate_detector_box = None
+        self.last_plate_detector_score = 0.0
         self.recent_reads.clear()
         self.current_candidates = []
         self.confirmed_plate = ""
@@ -1261,6 +1276,22 @@ class PlateReaderApp:
         if self.latest_frame is None:
             return
         now = time.time()
+        if self.vehicle_active and now > self.vehicle_read_until:
+            self._finish_unconfirmed_read(now, 1.5, "No se confirmo patente. Esperando proximo vehiculo...")
+            return
+
+        no_plate_timeout = float(self.config.get("no_plate_read_timeout_seconds", 1.2))
+        detector_ready = self.plate_detector.net is not None
+        if (
+            self.vehicle_active
+            and detector_ready
+            and not self.ocr_in_progress
+            and not self.recent_reads
+            and now - self.vehicle_started_at >= no_plate_timeout
+            and now - self.last_plate_detector_seen_at >= no_plate_timeout
+        ):
+            self._finish_unconfirmed_read(now, 0.35, "No se ve patente en la zona. Esperando proximo vehiculo...")
+            return
 
         automatic_window = (
             self.config["auto_read_on_vehicle"]
@@ -1285,15 +1316,18 @@ class PlateReaderApp:
         if self.config["always_scan"] or automatic_window or idle_window:
             self.last_ocr_time = now
             self._queue_ocr(self.latest_frame.copy())
-        elif self.vehicle_active and now > self.vehicle_read_until:
-            self.vehicle_active = False
-            self.cooldown_until = now + 1.5
-            if not self.confirmed_plate:
-                self.status_value.configure(text="No se confirmo patente. Esperando proximo vehiculo...")
-                self.plate_value.configure(text="---")
-                self.rut_value.configure(text="")
-                if self.config["clear_clipboard_on_vehicle_start"]:
-                    self._copy_to_clipboard("")
+
+    def _finish_unconfirmed_read(self, now, cooldown_seconds, message):
+        self.vehicle_active = False
+        self.cooldown_until = now + float(cooldown_seconds)
+        self.current_candidates = []
+        self.recent_reads.clear()
+        self.last_plate_detector_box = None
+        self.last_plate_detector_score = 0.0
+        if not self.confirmed_plate:
+            self.status_value.configure(text=message)
+            self.plate_value.configure(text="---")
+            self.rut_value.configure(text="")
 
     def _queue_ocr(self, frame):
         while True:
@@ -1303,6 +1337,7 @@ class PlateReaderApp:
                 break
         try:
             self.ocr_queue.put_nowait(("scan", frame))
+            self.ocr_in_progress = True
         except queue.Full:
             pass
 
@@ -1318,11 +1353,19 @@ class PlateReaderApp:
                 except queue.Empty:
                     break
 
-            crop, offset = self._crop_roi(frame)
-            candidates = self._read_frame(crop, offset)
-            if candidates:
-                self.frame_queue.put(("status", f"OCR: {', '.join(c.text for c in candidates[:3])}"))
-            self.frame_queue.put(("ocr_result", candidates))
+            try:
+                crop, offset = self._crop_roi(frame)
+                candidates = self._read_frame(crop, offset)
+                if candidates:
+                    self.frame_queue.put(("status", f"OCR: {', '.join(c.text for c in candidates[:3])}"))
+                self.frame_queue.put(("ocr_result", candidates))
+            except Exception as exc:
+                self.last_plate_detector_box = None
+                self.last_plate_detector_score = 0.0
+                self.frame_queue.put(("status", f"Error OCR/YOLO recuperado: {exc}"))
+                self.frame_queue.put(("ocr_result", []))
+            finally:
+                self.ocr_in_progress = False
 
     def _crop_roi(self, frame):
         polygon = self._get_plate_polygon()
@@ -1341,6 +1384,7 @@ class PlateReaderApp:
         ox, oy = offset
         self.last_plate_detector_box = (x1 + ox, y1 + oy, x2 + ox, y2 + oy)
         self.last_plate_detector_score = detection.score
+        self.last_plate_detector_seen_at = time.time()
         return crop[y1:y2, x1:x2], (x1 + ox, y1 + oy)
 
     def _get_plate_polygon(self):
@@ -1606,6 +1650,9 @@ class PlateReaderApp:
         votes_ok = votes >= int(self.config["min_confirm_votes"]) and vote_margin >= int(self.config["min_vote_margin"])
         if self.confirmed_plate == best:
             return
+        duplicate_seconds = float(self.config.get("duplicate_plate_suppression_seconds", 3.0))
+        if best == self.last_confirmed_plate and now - self.last_confirmed_at < duplicate_seconds:
+            return
         if not self.vehicle_active and not self.config["always_scan"]:
             self.plate_value.configure(text=best)
             score = float(best_stats["max_score"])
@@ -1631,6 +1678,8 @@ class PlateReaderApp:
             self.provisional_plate = best
             self.provisional_plate_at = now
             self.confirmed_at = now
+            self.last_confirmed_plate = best
+            self.last_confirmed_at = now
             self.vehicle_active = False
             self.cooldown_until = now + float(self.config["confirmed_cooldown_seconds"])
             self.confirmed_rut = f"RUT: {rut}" if rut else "Sin RUT asociado"
@@ -1656,6 +1705,21 @@ class PlateReaderApp:
             if self._show_rule_overlay_if_listed(best):
                 self.status_value.configure(text=f"Patente provisional con regla aplicada: {best}")
             self.rut_value.configure(text=f"Leyendo... {votes}/{self.config['min_confirm_votes']} ({score:0.2f})")
+
+    def _expire_confirmed_display(self):
+        if not self.confirmed_plate or self.vehicle_active:
+            return
+        seconds = float(self.config.get("confirmed_display_seconds", 2.5))
+        if time.time() - self.confirmed_at < seconds:
+            return
+        self.confirmed_plate = ""
+        self.confirmed_rut = ""
+        self.current_candidates = []
+        self.recent_reads.clear()
+        self.last_plate_detector_box = None
+        self.last_plate_detector_score = 0.0
+        self.plate_value.configure(text="---")
+        self.rut_value.configure(text="Esperando proximo vehiculo")
 
     def _copy_to_clipboard(self, text):
         self.root.clipboard_clear()
