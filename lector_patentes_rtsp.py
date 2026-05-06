@@ -78,7 +78,8 @@ DEFAULT_CONFIG = {
     "denied_message": "PATENTE EN LISTA DENEGADA",
     "max_frame_width": 1280,
     "open_timeout_ms": 5000,
-    "read_timeout_ms": 5000,
+    "read_timeout_ms": 2500,
+    "duplicate_frame_stall_seconds": 3.0,
 }
 
 
@@ -846,7 +847,16 @@ class AccessListDialog:
 
 
 class CameraReader(threading.Thread):
-    def __init__(self, rtsp_url, output_queue, stop_event, max_width, open_timeout_ms, read_timeout_ms):
+    def __init__(
+        self,
+        rtsp_url,
+        output_queue,
+        stop_event,
+        max_width,
+        open_timeout_ms,
+        read_timeout_ms,
+        duplicate_frame_stall_seconds,
+    ):
         super().__init__(daemon=True)
         self.rtsp_url = rtsp_url
         self.output_queue = output_queue
@@ -854,6 +864,7 @@ class CameraReader(threading.Thread):
         self.max_width = max_width
         self.open_timeout_ms = open_timeout_ms
         self.read_timeout_ms = read_timeout_ms
+        self.duplicate_frame_stall_seconds = duplicate_frame_stall_seconds
 
     def run(self):
         if not self.rtsp_url:
@@ -863,7 +874,10 @@ class CameraReader(threading.Thread):
         # TCP suele ser mas estable con camaras IP que UDP.
         import os
 
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000|timeout;5000000"
+        timeout_us = max(1_000_000, int(self.read_timeout_ms) * 1000)
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+            f"rtsp_transport;tcp|stimeout;{timeout_us}|timeout;{timeout_us}"
+        )
 
         while not self.stop_event.is_set():
             self.output_queue.put(("status", "Conectando camara..."))
@@ -885,11 +899,28 @@ class CameraReader(threading.Thread):
                 continue
 
             self.output_queue.put(("status", "Camara conectada"))
+            last_signature = None
+            duplicate_started_at = 0
             while not self.stop_event.is_set():
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     self.output_queue.put(("status", "Se perdio video. Reintentando..."))
                     break
+
+                now = time.time()
+                signature = self._frame_signature(frame)
+                if signature == last_signature:
+                    if duplicate_started_at == 0:
+                        duplicate_started_at = now
+                    elif (
+                        self.duplicate_frame_stall_seconds > 0
+                        and now - duplicate_started_at >= self.duplicate_frame_stall_seconds
+                    ):
+                        self.output_queue.put(("status", "Video congelado. Reconectando camara..."))
+                        break
+                else:
+                    last_signature = signature
+                    duplicate_started_at = 0
 
                 frame = self._resize(frame)
                 self._put_latest(("frame", frame))
@@ -915,6 +946,15 @@ class CameraReader(threading.Thread):
             return frame
         scale = self.max_width / width
         return cv2.resize(frame, (self.max_width, int(height * scale)), interpolation=cv2.INTER_AREA)
+
+    @staticmethod
+    def _frame_signature(frame):
+        try:
+            small = cv2.resize(frame, (32, 18), interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            return gray.tobytes()
+        except Exception:
+            return None
 
     def _put_latest(self, item):
         try:
@@ -1121,6 +1161,7 @@ class PlateReaderApp:
             int(self.config["max_frame_width"]),
             int(self.config["open_timeout_ms"]),
             int(self.config["read_timeout_ms"]),
+            float(self.config.get("duplicate_frame_stall_seconds", 3.0)),
         ).start()
         threading.Thread(target=self._ocr_worker, daemon=True).start()
 
