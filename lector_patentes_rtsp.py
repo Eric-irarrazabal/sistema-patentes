@@ -30,6 +30,9 @@ ACCESS_ALLOWED_SOUND_PATH = APP_DIR / "ACCESO PERMITIDO.mp3"
 ACCESS_DENIED_SOUND_PATH = APP_DIR / "ACCESO DENEGADO.mp3"
 ERROR_ALREADY_EXISTS = 183
 _SINGLE_INSTANCE_MUTEX = None
+_RULE_CACHE_AT = 0.0
+_RULE_ACCESS_ROWS = []
+_RULE_DENIED_ROWS = []
 
 
 DEFAULT_CONFIG = {
@@ -37,9 +40,9 @@ DEFAULT_CONFIG = {
     "roi": [0.0, 0.0, 1.0, 1.0],
     "plate_polygon": [],
     "vehicle_roi": [0.0, 0.0, 1.0, 1.0],
-    "ocr_interval_seconds": 0.08,
+    "ocr_interval_seconds": 0.12,
     "idle_scan_enabled": True,
-    "idle_ocr_interval_seconds": 0.25,
+    "idle_ocr_interval_seconds": 0.75,
     "always_scan": False,
     "auto_read_on_vehicle": True,
     "motion_enabled": True,
@@ -55,9 +58,9 @@ DEFAULT_CONFIG = {
     "fast_single_read_score": 0.70,
     "known_plate_single_read_score": 0.70,
     "max_candidates_per_frame": 2,
-    "ocr_preprocess_variants": 1,
-    "ocr_target_width": 760,
-    "known_plate_refresh_seconds": 0.5,
+    "ocr_preprocess_variants": 0,
+    "ocr_target_width": 640,
+    "known_plate_refresh_seconds": 1.0,
     "require_plate_in_database": False,
     "copy_confirmed_plate_to_clipboard": True,
     "copy_provisional_plate_to_clipboard": True,
@@ -65,12 +68,13 @@ DEFAULT_CONFIG = {
     "clear_clipboard_on_vehicle_start": True,
     "access_overlay_seconds": 4.0,
     "denied_message": "PATENTE EN LISTA DENEGADA",
-    "max_frame_width": 1280,
+    "max_frame_width": 960,
+    "display_interval_seconds": 0.10,
     "open_timeout_ms": 5000,
     "read_timeout_ms": 1800,
     "stream_stall_seconds": 2.0,
     "duplicate_frame_stall_seconds": 1.2,
-    "post_motion_freeze_watch_seconds": 8.0,
+    "post_motion_freeze_watch_seconds": 5.0,
 }
 
 
@@ -146,15 +150,20 @@ def load_config():
         float(config.get("known_plate_single_read_score", min_score)),
         min_score,
     )
-    config["ocr_interval_seconds"] = min(float(config.get("ocr_interval_seconds", 0.08)), 0.06)
-    config["idle_ocr_interval_seconds"] = min(float(config.get("idle_ocr_interval_seconds", 0.25)), 0.18)
+    config["ocr_interval_seconds"] = max(float(config.get("ocr_interval_seconds", 0.12)), 0.12)
+    config["idle_ocr_interval_seconds"] = max(float(config.get("idle_ocr_interval_seconds", 0.75)), 0.75)
     config["confirmed_cooldown_seconds"] = min(float(config.get("confirmed_cooldown_seconds", 1.0)), 0.25)
     config["restart_read_on_motion_after_confirm_seconds"] = min(
         float(config.get("restart_read_on_motion_after_confirm_seconds", 0.8)),
         0.2,
     )
-    config["known_plate_refresh_seconds"] = min(float(config.get("known_plate_refresh_seconds", 2.0)), 0.5)
+    config["known_plate_refresh_seconds"] = max(float(config.get("known_plate_refresh_seconds", 1.0)), 1.0)
     config["access_overlay_seconds"] = 4.0
+    config["max_frame_width"] = min(int(config.get("max_frame_width", 960)), 960)
+    config["ocr_preprocess_variants"] = min(int(config.get("ocr_preprocess_variants", 0)), 0)
+    config["ocr_target_width"] = min(int(config.get("ocr_target_width", 640)), 640)
+    config["post_motion_freeze_watch_seconds"] = min(float(config.get("post_motion_freeze_watch_seconds", 5.0)), 5.0)
+    config["display_interval_seconds"] = max(float(config.get("display_interval_seconds", 0.10)), 0.10)
     return config
 
 
@@ -378,6 +387,7 @@ def upsert_access_plate(plate, message=""):
     conn.commit()
     conn.close()
     delete_denied_plate(plate)
+    invalidate_rule_cache()
     return plate
 
 
@@ -387,6 +397,7 @@ def delete_access_plate(plate):
     conn.execute("DELETE FROM access_patentes WHERE patente = ?", (normalize_db_plate(plate),))
     conn.commit()
     conn.close()
+    invalidate_rule_cache()
 
 
 def list_access_plates():
@@ -417,6 +428,7 @@ def upsert_denied_plate(plate, message=""):
     conn.commit()
     conn.close()
     delete_access_plate(plate)
+    invalidate_rule_cache()
     return plate
 
 
@@ -426,6 +438,7 @@ def delete_denied_plate(plate):
     conn.execute("DELETE FROM denied_patentes WHERE patente = ?", (normalize_db_plate(plate),))
     conn.commit()
     conn.close()
+    invalidate_rule_cache()
 
 
 def list_denied_plates():
@@ -458,21 +471,39 @@ def get_access_record(plate):
     return row
 
 
+def invalidate_rule_cache():
+    global _RULE_CACHE_AT, _RULE_ACCESS_ROWS, _RULE_DENIED_ROWS
+    _RULE_CACHE_AT = 0.0
+    _RULE_ACCESS_ROWS = []
+    _RULE_DENIED_ROWS = []
+
+
+def get_cached_rule_rows(refresh_seconds=1.0):
+    global _RULE_CACHE_AT, _RULE_ACCESS_ROWS, _RULE_DENIED_ROWS
+    now = time.time()
+    if now - _RULE_CACHE_AT >= refresh_seconds:
+        _RULE_ACCESS_ROWS = list_access_plates()
+        _RULE_DENIED_ROWS = list_denied_plates()
+        _RULE_CACHE_AT = now
+    return _RULE_ACCESS_ROWS, _RULE_DENIED_ROWS
+
+
 def get_rule_record_for_plate(plate):
     plate = normalize_db_plate(plate)
+    access_rows, denied_rows = get_cached_rule_rows()
 
-    access_record = get_access_record(plate)
+    access_record = next((row for row in access_rows if normalize_db_plate(row[0]) == plate), None)
     if access_record:
         stored_plate, message = access_record
         return normalize_db_plate(stored_plate), True, message or ""
 
-    denied_record = get_denied_record(plate)
+    denied_record = next((row for row in denied_rows if normalize_db_plate(row[0]) == plate), None)
     if denied_record:
         stored_plate, message = denied_record
         return normalize_db_plate(stored_plate), False, message or ""
 
-    access_match = find_fuzzy_plate_match(plate, list_access_plates())
-    denied_match = find_fuzzy_plate_match(plate, list_denied_plates())
+    access_match = find_fuzzy_plate_match(plate, access_rows)
+    denied_match = find_fuzzy_plate_match(plate, denied_rows)
     matches = []
     if access_match:
         matched_plate, message = access_match
@@ -1024,6 +1055,7 @@ class PlateReaderApp:
         self.latest_frame = None
         self.latest_frame_at = 0
         self.latest_display = None
+        self.last_render_at = 0
         self.last_frame_signature = None
         self.same_frame_started_at = 0
         self.last_gray = None
@@ -1035,6 +1067,10 @@ class PlateReaderApp:
         self.vehicle_read_until = 0
         self.cooldown_until = 0
         self.confirmed_at = 0
+        self.last_vehicle_detected_at = 0
+        self.last_plate_read_at = 0
+        self.last_overlay_shown_at = 0
+        self.last_timing_summary = "Esperando medicion..."
         self.recent_reads = deque()
         self.current_candidates = []
         self.confirmed_plate = ""
@@ -1094,6 +1130,18 @@ class PlateReaderApp:
             panel, text="Iniciando...", bg="#111827", fg="#e2e8f0", font=("Segoe UI", 10), wraplength=290, justify="left"
         )
         self.status_value.pack(anchor="w", pady=(4, 18))
+
+        tk.Label(panel, text="Tiempos", bg="#111827", fg="#cbd5e1", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.timing_value = tk.Label(
+            panel,
+            text=self.last_timing_summary,
+            bg="#111827",
+            fg="#fde68a",
+            font=("Consolas", 10),
+            wraplength=290,
+            justify="left",
+        )
+        self.timing_value.pack(anchor="w", pady=(4, 18))
 
         tk.Label(panel, text="Lecturas recientes", bg="#111827", fg="#cbd5e1", font=("Segoe UI", 10, "bold")).pack(
             anchor="w"
@@ -1273,6 +1321,10 @@ class PlateReaderApp:
         self.last_detected_at = 0
         self.last_alert_plate = ""
         self.last_alert_at = 0
+        self.last_vehicle_detected_at = 0
+        self.last_plate_read_at = 0
+        self.last_overlay_shown_at = 0
+        self.last_timing_summary = "Esperando medicion..."
         self.last_clipboard_plate = ""
         self.last_clipboard_at = 0
         self.vehicle_active = False
@@ -1280,6 +1332,7 @@ class PlateReaderApp:
         self.confirmed_at = 0
         self.plate_value.configure(text="---")
         self.rut_value.configure(text="")
+        self.timing_value.configure(text=self.last_timing_summary)
         self._update_reads_list()
 
     def _tick(self):
@@ -1349,7 +1402,7 @@ class PlateReaderApp:
             return
 
         vehicle_area, _offset = self._crop_configured_roi(frame, self.config["vehicle_roi"])
-        small = cv2.resize(vehicle_area, (320, 180), interpolation=cv2.INTER_AREA)
+        small = cv2.resize(vehicle_area, (240, 135), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (9, 9), 0)
 
@@ -1377,6 +1430,9 @@ class PlateReaderApp:
     def _start_vehicle_read(self, now):
         self.vehicle_active = True
         self.vehicle_started_at = now
+        self.last_vehicle_detected_at = now
+        self.last_plate_read_at = 0
+        self.last_overlay_shown_at = 0
         self.vehicle_read_until = now + float(self.config["reading_timeout_seconds"])
         self.last_ocr_time = 0
         self.recent_reads.clear()
@@ -1388,6 +1444,7 @@ class PlateReaderApp:
             self._copy_to_clipboard("")
         self.plate_value.configure(text="Leyendo")
         self.rut_value.configure(text="Vehiculo detectado")
+        self.timing_value.configure(text="Vehiculo detectado: 0 ms")
         self.status_value.configure(text="Vehiculo detectado. Leyendo patente automaticamente...")
         if self.latest_frame is not None:
             self.last_ocr_time = time.time()
@@ -1651,6 +1708,7 @@ class PlateReaderApp:
         self.confirmed_plate = output_plate
         self.provisional_plate = output_plate
         self.confirmed_at = now
+        self.last_plate_read_at = now
         self.last_alert_plate = output_plate
         self.last_alert_at = now
         self.vehicle_active = False
@@ -1669,7 +1727,33 @@ class PlateReaderApp:
             self._show_access_overlay(output_plate, allowed, rule_message)
         else:
             self.status_value.configure(text=f"Patente copiada sin regla de acceso/denegado: {output_plate}")
+        self._update_timing_summary()
         return True
+
+    def _update_timing_summary(self):
+        if not self.last_vehicle_detected_at:
+            self.last_timing_summary = "Esperando medicion..."
+        else:
+            detect_to_plate_ms = (
+                int((self.last_plate_read_at - self.last_vehicle_detected_at) * 1000)
+                if self.last_plate_read_at
+                else None
+            )
+            detect_to_overlay_ms = (
+                int((self.last_overlay_shown_at - self.last_vehicle_detected_at) * 1000)
+                if self.last_overlay_shown_at
+                else None
+            )
+            if detect_to_plate_ms is None:
+                self.last_timing_summary = "Vehiculo detectado: esperando patente..."
+            elif detect_to_overlay_ms is None:
+                self.last_timing_summary = f"Vehiculo->Patente: {detect_to_plate_ms} ms"
+            else:
+                self.last_timing_summary = (
+                    f"Vehiculo->Patente: {detect_to_plate_ms} ms\n"
+                    f"Vehiculo->Alerta: {detect_to_overlay_ms} ms"
+                )
+        self.timing_value.configure(text=self.last_timing_summary)
 
     def _update_confirmation(self):
         if not self.recent_reads:
@@ -1835,6 +1919,8 @@ class PlateReaderApp:
 
         overlay = tk.Toplevel(self.root)
         self.access_overlay = overlay
+        self.last_overlay_shown_at = time.time()
+        self._update_timing_summary()
         overlay.configure(bg=bg)
         overlay.overrideredirect(True)
         overlay.attributes("-topmost", True)
@@ -1899,6 +1985,10 @@ class PlateReaderApp:
     def _render_frame(self):
         if self.latest_frame is None:
             return
+        now = time.time()
+        if now - self.last_render_at < float(self.config.get("display_interval_seconds", 0.10)):
+            return
+        self.last_render_at = now
 
         frame = self.latest_frame.copy()
         self._draw_roi(frame)
