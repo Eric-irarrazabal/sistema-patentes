@@ -25,6 +25,7 @@ APP_NAME = "Lector de Patentes RTSP"
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "camera_config.json"
 DB_PATH = APP_DIR / "patentes_rut.sqlite3"
+CLIPBOARD_GUARD_PATH = APP_DIR / "clipboard_guard.json"
 ERROR_ALREADY_EXISTS = 183
 _SINGLE_INSTANCE_MUTEX = None
 
@@ -43,8 +44,8 @@ DEFAULT_CONFIG = {
     "motion_threshold": 0.025,
     "read_after_motion_delay_seconds": 0.0,
     "reading_timeout_seconds": 5.0,
-    "confirmed_cooldown_seconds": 1.0,
-    "restart_read_on_motion_after_confirm_seconds": 0.8,
+    "confirmed_cooldown_seconds": 0.25,
+    "restart_read_on_motion_after_confirm_seconds": 0.2,
     "recent_read_seconds": 1.2,
     "min_confirm_votes": 1,
     "min_vote_margin": 0,
@@ -54,7 +55,7 @@ DEFAULT_CONFIG = {
     "max_candidates_per_frame": 2,
     "ocr_preprocess_variants": 1,
     "ocr_target_width": 760,
-    "known_plate_refresh_seconds": 2.0,
+    "known_plate_refresh_seconds": 0.5,
     "require_plate_in_database": False,
     "copy_confirmed_plate_to_clipboard": True,
     "copy_provisional_plate_to_clipboard": True,
@@ -143,6 +144,14 @@ def load_config():
         float(config.get("known_plate_single_read_score", min_score)),
         min_score,
     )
+    config["ocr_interval_seconds"] = min(float(config.get("ocr_interval_seconds", 0.08)), 0.06)
+    config["idle_ocr_interval_seconds"] = min(float(config.get("idle_ocr_interval_seconds", 0.25)), 0.18)
+    config["confirmed_cooldown_seconds"] = min(float(config.get("confirmed_cooldown_seconds", 1.0)), 0.25)
+    config["restart_read_on_motion_after_confirm_seconds"] = min(
+        float(config.get("restart_read_on_motion_after_confirm_seconds", 0.8)),
+        0.2,
+    )
+    config["known_plate_refresh_seconds"] = min(float(config.get("known_plate_refresh_seconds", 2.0)), 0.5)
     return config
 
 
@@ -479,6 +488,76 @@ def get_rule_record_for_plate(plate):
     return matched_plate, allowed, message or ""
 
 
+def ensure_read_history_table():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS plate_read_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patente TEXT NOT NULL,
+            read_date TEXT NOT NULL,
+            read_time TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_plate_read_history_date ON plate_read_history(read_date, id)")
+    conn.commit()
+    conn.close()
+
+
+def insert_plate_read_history(plate):
+    plate = normalize_db_plate(plate)
+    if not looks_like_plate(plate):
+        return ""
+    ensure_read_history_table()
+    now = time.localtime()
+    read_time = time.strftime("%H:%M:%S", now)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO plate_read_history (patente, read_date, read_time) VALUES (?, ?, ?)",
+        (plate, time.strftime("%Y-%m-%d", now), read_time),
+    )
+    conn.commit()
+    conn.close()
+    return read_time
+
+
+def list_today_plate_history(limit=80):
+    ensure_read_history_table()
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        """
+        SELECT patente, read_time
+        FROM plate_read_history
+        WHERE read_date = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (today, int(limit)),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def clipboard_guard_active():
+    if not CLIPBOARD_GUARD_PATH.exists():
+        return False
+    try:
+        data = json.loads(CLIPBOARD_GUARD_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    until = float(data.get("until", 0) or 0)
+    if time.time() < until:
+        return True
+    try:
+        CLIPBOARD_GUARD_PATH.unlink()
+    except OSError:
+        pass
+    return False
+
+
 def enforce_single_instance(name):
     global _SINGLE_INSTANCE_MUTEX
     kernel32 = ctypes.windll.kernel32
@@ -515,8 +594,9 @@ class AccessListDialog:
         },
     }
 
-    def __init__(self, parent):
+    def __init__(self, parent, initial_plate=""):
         self.parent = parent
+        self.initial_plate = normalize_db_plate(initial_plate)
         self.rows = []
         self.window = tk.Toplevel(parent)
         self.window.title("Listas de patentes")
@@ -534,6 +614,9 @@ class AccessListDialog:
 
         self._build()
         self.reload()
+        if self.initial_plate:
+            self.plate_var.set(self.initial_plate)
+            self._select_plate(self.initial_plate)
         self.plate_entry.focus_set()
 
     def _build(self):
@@ -603,6 +686,7 @@ class AccessListDialog:
         )
         self.plate_entry.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         self.plate_entry.bind("<Return>", lambda _event: self.save())
+        self._bind_entry_shortcuts(self.plate_entry)
 
         self.message_entry = tk.Entry(
             form,
@@ -615,6 +699,7 @@ class AccessListDialog:
         )
         self.message_entry.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(4, 0))
         self.message_entry.bind("<Return>", lambda _event: self.save())
+        self._bind_entry_shortcuts(self.message_entry)
         form.grid_columnconfigure(0, weight=1)
         form.grid_columnconfigure(1, weight=2)
 
@@ -686,6 +771,8 @@ class AccessListDialog:
         scrollbar.pack(side="right", fill="y")
         self.listbox.configure(yscrollcommand=scrollbar.set)
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
+        self.listbox.bind("<Control-c>", self._copy_selected_row)
+        self.listbox.bind("<Control-C>", self._copy_selected_row)
 
         tk.Label(
             self.window,
@@ -699,6 +786,26 @@ class AccessListDialog:
 
     def _mode(self):
         return self.MODES[self.mode_var.get()]
+
+    def _bind_entry_shortcuts(self, entry):
+        entry.bind("<Control-a>", lambda _event: (entry.select_range(0, tk.END), "break")[-1])
+        entry.bind("<Control-A>", lambda _event: (entry.select_range(0, tk.END), "break")[-1])
+        entry.bind("<Control-c>", lambda _event: (entry.event_generate("<<Copy>>"), "break")[-1])
+        entry.bind("<Control-C>", lambda _event: (entry.event_generate("<<Copy>>"), "break")[-1])
+        entry.bind("<Control-v>", lambda _event: (entry.event_generate("<<Paste>>"), "break")[-1])
+        entry.bind("<Control-V>", lambda _event: (entry.event_generate("<<Paste>>"), "break")[-1])
+        entry.bind("<Control-x>", lambda _event: (entry.event_generate("<<Cut>>"), "break")[-1])
+        entry.bind("<Control-X>", lambda _event: (entry.event_generate("<<Cut>>"), "break")[-1])
+
+    def _copy_selected_row(self, _event=None):
+        index = self._selected_index()
+        if index is None:
+            return "break"
+        plate, message = self.rows[index]
+        text = f"{plate} {message}".strip()
+        self.window.clipboard_clear()
+        self.window.clipboard_append(text)
+        return "break"
 
     def reload(self):
         mode = self._mode()
@@ -930,6 +1037,13 @@ class PlateReaderApp:
         self.confirmed_plate = ""
         self.confirmed_rut = ""
         self.provisional_plate = ""
+        self.last_detected_plate = ""
+        self.last_detected_at = 0
+        self.last_history_plate = ""
+        self.last_history_at = 0
+        self.last_alert_plate = ""
+        self.last_alert_at = 0
+        self.today_history = []
         self.last_clipboard_plate = ""
         self.last_clipboard_at = 0
         self.access_overlay = None
@@ -946,8 +1060,11 @@ class PlateReaderApp:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         ensure_access_table()
         ensure_denied_table()
+        ensure_read_history_table()
+        self.today_history = list_today_plate_history()
 
         self._build_ui()
+        self._update_reads_list()
         self._start_workers()
         self._tick()
 
@@ -1097,7 +1214,7 @@ class PlateReaderApp:
             self._queue_ocr(self.latest_frame.copy())
 
     def open_access_dialog(self):
-        AccessListDialog(self.root)
+        AccessListDialog(self.root, self.last_detected_plate or self.provisional_plate or self.confirmed_plate)
 
     def start_polygon_selection(self):
         self.selecting_polygon = True
@@ -1149,6 +1266,10 @@ class PlateReaderApp:
         self.confirmed_plate = ""
         self.confirmed_rut = ""
         self.provisional_plate = ""
+        self.last_detected_plate = ""
+        self.last_detected_at = 0
+        self.last_alert_plate = ""
+        self.last_alert_at = 0
         self.last_clipboard_plate = ""
         self.last_clipboard_at = 0
         self.vehicle_active = False
@@ -1156,7 +1277,7 @@ class PlateReaderApp:
         self.confirmed_at = 0
         self.plate_value.configure(text="---")
         self.rut_value.configure(text="")
-        self.reads_list.delete(0, tk.END)
+        self._update_reads_list()
 
     def _tick(self):
         try:
@@ -1480,10 +1601,72 @@ class PlateReaderApp:
         while self.recent_reads and now - self.recent_reads[0][0] > float(self.config["recent_read_seconds"]):
             self.recent_reads.popleft()
 
+        for candidate in candidates[:max_candidates]:
+            rule_record = get_rule_record_for_plate(candidate.text)
+            if rule_record and float(candidate.score or 0.0) >= float(self.config["min_ocr_score"]):
+                self._confirm_candidate_plate(candidate.text, rule_record)
+                self._update_reads_list()
+                return
+
         self._update_confirmation()
         self._update_reads_list()
         if self.vehicle_active and not candidates and not self.confirmed_plate:
             self.status_value.configure(text="Vehiculo detectado. Buscando texto de patente...")
+
+    def _record_plate_history_once(self, plate):
+        now = time.time()
+        plate = normalize_db_plate(plate)
+        self.last_detected_plate = plate
+        self.last_detected_at = now
+        if plate == self.last_history_plate and now - self.last_history_at < 2.0:
+            return
+        read_time = insert_plate_read_history(plate)
+        if read_time:
+            self.today_history.insert(0, (plate, read_time))
+            self.today_history = self.today_history[:80]
+        self.last_history_plate = plate
+        self.last_history_at = now
+
+    def _confirm_candidate_plate(self, raw_plate, rule_record=None):
+        now = time.time()
+        rule_record = rule_record or get_rule_record_for_plate(raw_plate)
+        output_plate = rule_record[0] if rule_record else normalize_db_plate(raw_plate)
+        if output_plate == self.last_alert_plate and now - self.last_alert_at < 3.0:
+            self.last_detected_plate = output_plate
+            self.last_detected_at = now
+            if self.config["copy_confirmed_plate_to_clipboard"]:
+                self._copy_plate_to_clipboard(output_plate)
+            return True
+
+        rut = get_rut_for_plate(output_plate)
+        if self.config["require_plate_in_database"] and not rut and not rule_record:
+            self.status_value.configure(text=f"{output_plate} leida, pero no esta en la tabla. No se copia.")
+            self.plate_value.configure(text=output_plate)
+            self.rut_value.configure(text="No esta en BD")
+            return False
+
+        self.confirmed_plate = output_plate
+        self.provisional_plate = output_plate
+        self.confirmed_at = now
+        self.last_alert_plate = output_plate
+        self.last_alert_at = now
+        self.vehicle_active = False
+        self.cooldown_until = now + float(self.config["confirmed_cooldown_seconds"])
+        self.confirmed_rut = f"RUT: {rut}" if rut else "Sin RUT asociado"
+        self.plate_value.configure(text=output_plate)
+        self.rut_value.configure(text=self.confirmed_rut)
+        self._record_plate_history_once(output_plate)
+        if self.config["copy_confirmed_plate_to_clipboard"]:
+            self._copy_plate_to_clipboard(output_plate, force=True)
+            self.status_value.configure(text=f"Patente confirmada y copiada al portapapeles: {output_plate}")
+        else:
+            self.status_value.configure(text=f"Patente confirmada automaticamente: {output_plate}")
+        if rule_record:
+            _stored_plate, allowed, rule_message = rule_record
+            self._show_access_overlay(output_plate, allowed, rule_message)
+        else:
+            self.status_value.configure(text=f"Patente copiada sin regla de acceso/denegado: {output_plate}")
+        return True
 
     def _update_confirmation(self):
         if not self.recent_reads:
@@ -1511,48 +1694,25 @@ class PlateReaderApp:
             self.plate_value.configure(text=best)
             score = float(best_stats["max_score"])
             if self.config.get("copy_provisional_plate_to_clipboard", True):
-                self.provisional_plate = best
-                if self._copy_plate_to_clipboard(best):
-                    self.status_value.configure(text=f"Prelectura copiada al portapapeles: {best}")
+                self.provisional_plate = output_plate
+                if self._copy_plate_to_clipboard(output_plate):
+                    self.status_value.configure(text=f"Prelectura copiada al portapapeles: {output_plate}")
             self.rut_value.configure(text=f"Preleyendo... {score:0.2f}")
             return
         if single_read_ok:
-            now = time.time()
-            rut = get_rut_for_plate(output_plate)
-            if self.config["require_plate_in_database"] and not rut and not rule_record:
-                self.status_value.configure(text=f"{output_plate} leida, pero no esta en la tabla. No se copia.")
-                self.plate_value.configure(text=output_plate)
-                self.rut_value.configure(text="No esta en BD")
-                return
-
-            self.confirmed_plate = output_plate
-            self.provisional_plate = output_plate
-            self.confirmed_at = now
-            self.vehicle_active = False
-            self.cooldown_until = now + float(self.config["confirmed_cooldown_seconds"])
-            self.confirmed_rut = f"RUT: {rut}" if rut else "Sin RUT asociado"
-            self.plate_value.configure(text=output_plate)
-            self.rut_value.configure(text=self.confirmed_rut)
-            if self.config["copy_confirmed_plate_to_clipboard"]:
-                self._copy_plate_to_clipboard(output_plate, force=True)
-                self.status_value.configure(text=f"Patente confirmada y copiada al portapapeles: {output_plate}")
-            else:
-                self.status_value.configure(text=f"Patente confirmada automaticamente: {output_plate}")
-            if rule_record:
-                _stored_plate, allowed, rule_message = rule_record
-                self._show_access_overlay(output_plate, allowed, rule_message)
-            else:
-                self.status_value.configure(text=f"Patente copiada sin regla de acceso/denegado: {output_plate}")
+            self._confirm_candidate_plate(best, rule_record)
         elif not self.confirmed_plate:
             self.plate_value.configure(text=best)
             score = float(best_stats["max_score"])
             if self.config.get("copy_provisional_plate_to_clipboard", True):
-                self.provisional_plate = best
-                if self._copy_plate_to_clipboard(best):
-                    self.status_value.configure(text=f"Patente provisional copiada al portapapeles: {best}")
+                self.provisional_plate = output_plate
+                if self._copy_plate_to_clipboard(output_plate):
+                    self.status_value.configure(text=f"Patente provisional copiada al portapapeles: {output_plate}")
             self.rut_value.configure(text=f"Leyendo... 1/1 ({score:0.2f})")
 
     def _copy_to_clipboard(self, text):
+        if not text and clipboard_guard_active():
+            return
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.root.update()
@@ -1566,6 +1726,8 @@ class PlateReaderApp:
     def _copy_plate_to_clipboard(self, plate, force=False):
         plate = normalize_db_plate(plate)
         if not plate:
+            return False
+        if clipboard_guard_active():
             return False
         now = time.time()
         interval = float(self.config.get("recopy_clipboard_interval_seconds", 0.45))
@@ -1705,9 +1867,8 @@ class PlateReaderApp:
 
     def _update_reads_list(self):
         self.reads_list.delete(0, tk.END)
-        rows = list(self.recent_reads)[-12:]
-        for _t, text, score in reversed(rows):
-            self.reads_list.insert(tk.END, f"{text:<8} {score:0.2f}")
+        for plate, read_time in self.today_history:
+            self.reads_list.insert(tk.END, f"{plate:<8} - {read_time}")
 
     def _render_frame(self):
         if self.latest_frame is None:

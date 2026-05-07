@@ -16,6 +16,7 @@ APP_NAME = "Patente RUT Flotante"
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "patentes_rut.sqlite3"
 CONFIG_PATH = APP_DIR / "config.json"
+CLIPBOARD_GUARD_PATH = APP_DIR / "clipboard_guard.json"
 ERROR_ALREADY_EXISTS = 183
 _SINGLE_INSTANCE_MUTEX = None
 
@@ -30,6 +31,11 @@ def normalize_patente(value):
 
 def normalize_rut(value):
     return re.sub(r"[^0-9K]", "", (value or "").upper())
+
+
+def is_rut_like(value):
+    value = normalize_rut(value)
+    return 7 <= len(value) <= 9 and any(char.isdigit() for char in value)
 
 
 def is_plate_like(value):
@@ -134,9 +140,21 @@ class PlateRutDatabase:
             WHERE rut IS NOT NULL AND rut <> ''
             """
         ).fetchall()
-        if not rows:
+        ruts = [normalize_rut(row[0]) for row in rows if is_rut_like(row[0])]
+        if not ruts:
             return None
-        return random.choice(rows)[0]
+        return random.choice(ruts)
+
+
+def protect_clipboard_from_plate_copy(seconds=5.0):
+    until = time.time() + float(seconds)
+    try:
+        CLIPBOARD_GUARD_PATH.write_text(
+            json.dumps({"until": until, "reason": "random_rut"}, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 class Win32:
@@ -536,6 +554,11 @@ class FloatingApp:
             patente, rut = self.db.lookup_text(raw_text)
             if not rut:
                 Clipboard.set_text(original_clipboard)
+                candidates = patente_candidates(raw_text)
+                if candidates:
+                    self.open_add_dialog(candidates[0])
+                    self._flash("+", "#2563eb")
+                    return
                 self._flash("NO", "#dc2626")
                 Win32.user32.MessageBeep(0xFFFFFFFF)
                 return
@@ -548,18 +571,22 @@ class FloatingApp:
         finally:
             self.busy = False
 
-    def open_add_dialog(self):
-        try:
-            prefill, original_clipboard = self._copy_active_field()
-            Clipboard.set_text(original_clipboard)
-        except Exception:
-            prefill = ""
+    def open_add_dialog(self, patente_prefill=None):
+        if patente_prefill is None:
+            try:
+                prefill, original_clipboard = self._copy_active_field()
+                Clipboard.set_text(original_clipboard)
+            except Exception:
+                prefill = ""
+            patente_prefill = patente_candidates(prefill)
+            patente_prefill = patente_prefill[0] if patente_prefill else ""
+        else:
+            patente_prefill = normalize_patente(patente_prefill)
 
-        patente_prefill = patente_candidates(prefill)
         dialog = AddMappingDialog(
             self.root,
             self.db,
-            patente_prefill[0] if patente_prefill else "",
+            patente_prefill,
             self._on_saved_mapping,
         )
         dialog.show()
@@ -576,7 +603,9 @@ class FloatingApp:
             if not rut:
                 self._flash("SIN", "#dc2626")
                 return
+            protect_clipboard_from_plate_copy()
             Clipboard.set_text(rut)
+            protect_clipboard_from_plate_copy()
             self._flash("RND", "#7c3aed")
         except Exception as exc:
             self._flash("ERR", "#dc2626")
@@ -709,12 +738,14 @@ class AddMappingDialog:
         self.patente_entry = tk.Entry(outer, width=20, font=("Segoe UI", 12))
         self.patente_entry.grid(row=1, column=0, sticky="ew", pady=(2, 9))
         self.patente_entry.insert(0, patente_prefill)
+        self._bind_entry_shortcuts(self.patente_entry)
 
         tk.Label(outer, text="RUT sin formato", bg="#f8fafc", fg="#334155", font=("Segoe UI", 9, "bold")).grid(
             row=2, column=0, sticky="w"
         )
         self.rut_entry = tk.Entry(outer, width=20, font=("Segoe UI", 12))
         self.rut_entry.grid(row=3, column=0, sticky="ew", pady=(2, 12))
+        self._bind_entry_shortcuts(self.rut_entry)
 
         buttons = tk.Frame(outer, bg="#f8fafc")
         buttons.grid(row=4, column=0, sticky="ew")
@@ -747,6 +778,16 @@ class AddMappingDialog:
 
         self.window.bind("<Return>", lambda _event: self.save())
         self.window.bind("<Escape>", lambda _event: self.window.destroy())
+
+    def _bind_entry_shortcuts(self, entry):
+        entry.bind("<Control-a>", lambda _event: (entry.select_range(0, tk.END), "break")[-1])
+        entry.bind("<Control-A>", lambda _event: (entry.select_range(0, tk.END), "break")[-1])
+        entry.bind("<Control-c>", lambda _event: (entry.event_generate("<<Copy>>"), "break")[-1])
+        entry.bind("<Control-C>", lambda _event: (entry.event_generate("<<Copy>>"), "break")[-1])
+        entry.bind("<Control-v>", lambda _event: (entry.event_generate("<<Paste>>"), "break")[-1])
+        entry.bind("<Control-V>", lambda _event: (entry.event_generate("<<Paste>>"), "break")[-1])
+        entry.bind("<Control-x>", lambda _event: (entry.event_generate("<<Cut>>"), "break")[-1])
+        entry.bind("<Control-X>", lambda _event: (entry.event_generate("<<Cut>>"), "break")[-1])
 
     def show(self):
         self.window.update_idletasks()
@@ -783,6 +824,8 @@ def run_self_tests():
         assert db.lookup_patente("abcd12") == "12345678K"
         assert db.lookup_text("ABCD12")[1] == "12345678K"
         assert db.lookup_text("ABCD12 12345678K")[1] == "12345678K"
+        assert db.random_rut() == "12345678K"
+        db.upsert("WXYZ99", "ABCD12")
         assert db.random_rut() == "12345678K"
         db.close()
 
