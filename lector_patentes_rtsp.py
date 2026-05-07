@@ -39,13 +39,15 @@ DEFAULT_CONFIG = {
     "rtsp_url": "",
     "roi": [0.0, 0.0, 1.0, 1.0],
     "plate_polygon": [],
+    "wake_polygon": [],
     "vehicle_roi": [0.0, 0.0, 1.0, 1.0],
     "ocr_interval_seconds": 0.12,
-    "idle_scan_enabled": True,
+    "idle_scan_enabled": False,
     "idle_ocr_interval_seconds": 0.75,
     "always_scan": False,
     "auto_read_on_vehicle": True,
     "motion_enabled": True,
+    "motion_analysis_interval_seconds": 0.06,
     "motion_threshold": 0.025,
     "read_after_motion_delay_seconds": 0.0,
     "reading_timeout_seconds": 5.0,
@@ -159,11 +161,16 @@ def load_config():
     )
     config["known_plate_refresh_seconds"] = max(float(config.get("known_plate_refresh_seconds", 1.0)), 1.0)
     config["access_overlay_seconds"] = 4.0
+    config["idle_scan_enabled"] = False
     config["max_frame_width"] = min(int(config.get("max_frame_width", 960)), 960)
     config["ocr_preprocess_variants"] = min(int(config.get("ocr_preprocess_variants", 0)), 0)
     config["ocr_target_width"] = min(int(config.get("ocr_target_width", 640)), 640)
     config["post_motion_freeze_watch_seconds"] = min(float(config.get("post_motion_freeze_watch_seconds", 5.0)), 5.0)
     config["display_interval_seconds"] = max(float(config.get("display_interval_seconds", 0.10)), 0.10)
+    config["motion_analysis_interval_seconds"] = max(
+        float(config.get("motion_analysis_interval_seconds", 0.06)),
+        0.06,
+    )
     return config
 
 
@@ -1061,6 +1068,7 @@ class PlateReaderApp:
         self.last_gray = None
         self.last_motion_ratio = 0.0
         self.last_motion_time = 0
+        self.last_motion_analysis_at = 0
         self.last_ocr_time = 0
         self.vehicle_active = False
         self.vehicle_started_at = 0
@@ -1089,6 +1097,7 @@ class PlateReaderApp:
         self.known_plates = set()
         self.known_plates_loaded_at = 0
         self.selecting_polygon = False
+        self.selection_target = "plate"
         self.pending_polygon = []
         self.display_info = None
 
@@ -1238,9 +1247,36 @@ class PlateReaderApp:
             padx=10,
             pady=6,
         ).pack(side="left")
+        tk.Button(
+            button_row3,
+            text="Zona despertar",
+            command=self.start_wake_polygon_selection,
+            bg="#0891b2",
+            fg="white",
+            activebackground="#0e7490",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+            pady=6,
+        ).pack(side="left", padx=(8, 0))
+
+        button_row4 = tk.Frame(panel, bg="#111827")
+        button_row4.pack(fill="x", pady=(0, 12))
+        tk.Button(
+            button_row4,
+            text="Borrar despertar",
+            command=self.clear_wake_polygon,
+            bg="#475569",
+            fg="white",
+            activebackground="#334155",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+            pady=6,
+        ).pack(side="left")
 
         help_text = (
-            "Modo estricto: define una zona poligonal para leer solo donde esta la patente. "
+            "Modo rapido: la zona despertar activa la lectura antes de que el auto llegue a la zona patente. "
             "Al confirmar, copia la patente y muestra acceso autorizado o denegado."
         )
         tk.Label(panel, text=help_text, bg="#111827", fg="#94a3b8", font=("Segoe UI", 9), wraplength=290, justify="left").pack(
@@ -1269,18 +1305,33 @@ class PlateReaderApp:
 
     def start_polygon_selection(self):
         self.selecting_polygon = True
+        self.selection_target = "plate"
         self.pending_polygon = []
         self.status_value.configure(text="Marca la zona de patente con clics sobre el video. Luego presiona Guardar zona.")
+
+    def start_wake_polygon_selection(self):
+        self.selecting_polygon = True
+        self.selection_target = "wake"
+        self.pending_polygon = []
+        self.status_value.configure(
+            text="Marca la zona donde el auto aparece primero. Luego presiona Guardar zona."
+        )
 
     def save_polygon_selection(self):
         if len(self.pending_polygon) < 3:
             messagebox.showwarning(APP_NAME, "Marca al menos 3 puntos para guardar la zona.", parent=self.root)
             return
-        self.config["plate_polygon"] = self.pending_polygon[:]
+        if self.selection_target == "wake":
+            self.config["wake_polygon"] = self.pending_polygon[:]
+            message = "Zona despertar guardada. Cuando detecte movimiento ahi, activara OCR rapido."
+            self.last_gray = None
+        else:
+            self.config["plate_polygon"] = self.pending_polygon[:]
+            message = "Zona de patente guardada. El OCR solo leera dentro de ese poligono."
         self._save_config()
         self.selecting_polygon = False
         self.pending_polygon = []
-        self.status_value.configure(text="Zona de patente guardada. El OCR solo leera dentro de ese poligono.")
+        self.status_value.configure(text=message)
 
     def clear_plate_polygon(self):
         self.config["plate_polygon"] = []
@@ -1288,6 +1339,14 @@ class PlateReaderApp:
         self.selecting_polygon = False
         self._save_config()
         self.status_value.configure(text="Zona de patente borrada. El OCR volvera a usar el rectangulo ROI completo.")
+
+    def clear_wake_polygon(self):
+        self.config["wake_polygon"] = []
+        self.pending_polygon = []
+        self.selecting_polygon = False
+        self.last_gray = None
+        self._save_config()
+        self.status_value.configure(text="Zona despertar borrada. El movimiento volvera a usar el area completa.")
 
     def _save_config(self):
         CONFIG_PATH.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
@@ -1309,7 +1368,8 @@ class PlateReaderApp:
             max(0.0, min(1.0, frame_y / info["frame_h"])),
         ]
         self.pending_polygon.append(normalized)
-        self.status_value.configure(text=f"Puntos zona patente: {len(self.pending_polygon)}. Presiona Guardar zona al terminar.")
+        label = "despertar" if self.selection_target == "wake" else "patente"
+        self.status_value.configure(text=f"Puntos zona {label}: {len(self.pending_polygon)}. Presiona Guardar zona al terminar.")
 
     def clear_reads(self):
         self.recent_reads.clear()
@@ -1401,12 +1461,17 @@ class PlateReaderApp:
             self.last_motion_time = time.time()
             return
 
-        vehicle_area, _offset = self._crop_configured_roi(frame, self.config["vehicle_roi"])
+        now = time.time()
+        if now - self.last_motion_analysis_at < float(self.config.get("motion_analysis_interval_seconds", 0.06)):
+            return
+        self.last_motion_analysis_at = now
+
+        vehicle_area, _offset = self._crop_motion_area(frame)
         small = cv2.resize(vehicle_area, (240, 135), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (9, 9), 0)
 
-        if self.last_gray is None:
+        if self.last_gray is None or self.last_gray.shape != gray.shape:
             self.last_gray = gray
             return
 
@@ -1416,7 +1481,6 @@ class PlateReaderApp:
         self.last_gray = cv2.addWeighted(self.last_gray, 0.75, gray, 0.25, 0)
 
         if changed >= float(self.config["motion_threshold"]):
-            now = time.time()
             self.last_motion_time = now
             if self.config["auto_read_on_vehicle"] and not self.vehicle_active:
                 cooldown_ready = now >= self.cooldown_until
@@ -1530,6 +1594,16 @@ class PlateReaderApp:
     def _get_plate_polygon(self):
         polygon = self.config.get("plate_polygon") or []
         return polygon if len(polygon) >= 3 else []
+
+    def _get_wake_polygon(self):
+        polygon = self.config.get("wake_polygon") or []
+        return polygon if len(polygon) >= 3 else []
+
+    def _crop_motion_area(self, frame):
+        polygon = self._get_wake_polygon()
+        if polygon:
+            return self._crop_polygon(frame, polygon)
+        return self._crop_configured_roi(frame, self.config["vehicle_roi"])
 
     def _crop_polygon(self, frame, normalized_polygon):
         height, width = frame.shape[:2]
@@ -2030,9 +2104,11 @@ class PlateReaderApp:
         cv2.rectangle(frame, (x1, y1), (x2, y2), (37, 99, 235), 2)
 
     def _draw_plate_polygon(self, frame):
+        self._draw_normalized_polygon(frame, self._get_wake_polygon(), (0, 200, 255), "ZONA DESPERTAR")
         self._draw_normalized_polygon(frame, self._get_plate_polygon(), (34, 197, 94), "ZONA PATENTE")
         if self.selecting_polygon:
-            self._draw_normalized_polygon(frame, self.pending_polygon, (250, 204, 21), "NUEVA ZONA")
+            label = "NUEVA DESPERTAR" if self.selection_target == "wake" else "NUEVA PATENTE"
+            self._draw_normalized_polygon(frame, self.pending_polygon, (250, 204, 21), label)
 
     def _draw_normalized_polygon(self, frame, polygon, color, label):
         if not polygon:
