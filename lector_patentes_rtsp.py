@@ -47,7 +47,7 @@ DEFAULT_CONFIG = {
     "always_scan": False,
     "auto_read_on_vehicle": True,
     "motion_enabled": True,
-    "motion_analysis_interval_seconds": 0.06,
+    "motion_analysis_interval_seconds": 0.10,
     "motion_threshold": 0.025,
     "read_after_motion_delay_seconds": 0.0,
     "reading_timeout_seconds": 5.0,
@@ -71,7 +71,10 @@ DEFAULT_CONFIG = {
     "access_overlay_seconds": 4.0,
     "denied_message": "PATENTE EN LISTA DENEGADA",
     "max_frame_width": 960,
-    "display_interval_seconds": 0.10,
+    "camera_frame_interval_seconds": 0.10,
+    "camera_grab_interval_seconds": 0.03,
+    "display_interval_seconds": 0.16,
+    "ui_tick_interval_ms": 50,
     "open_timeout_ms": 5000,
     "read_timeout_ms": 1800,
     "stream_stall_seconds": 2.0,
@@ -162,14 +165,28 @@ def load_config():
     config["known_plate_refresh_seconds"] = max(float(config.get("known_plate_refresh_seconds", 1.0)), 1.0)
     config["access_overlay_seconds"] = 4.0
     config["idle_scan_enabled"] = False
+    config["always_scan"] = False
     config["max_frame_width"] = min(int(config.get("max_frame_width", 960)), 960)
     config["ocr_preprocess_variants"] = min(int(config.get("ocr_preprocess_variants", 0)), 0)
     config["ocr_target_width"] = min(int(config.get("ocr_target_width", 640)), 640)
     config["post_motion_freeze_watch_seconds"] = min(float(config.get("post_motion_freeze_watch_seconds", 5.0)), 5.0)
-    config["display_interval_seconds"] = max(float(config.get("display_interval_seconds", 0.10)), 0.10)
+    config["camera_frame_interval_seconds"] = max(
+        float(config.get("camera_frame_interval_seconds", 0.10)),
+        0.10,
+    )
+    config["camera_grab_interval_seconds"] = max(
+        float(config.get("camera_grab_interval_seconds", 0.03)),
+        0.03,
+    )
+    config["camera_grab_interval_seconds"] = min(
+        float(config["camera_grab_interval_seconds"]),
+        float(config["camera_frame_interval_seconds"]),
+    )
+    config["display_interval_seconds"] = max(float(config.get("display_interval_seconds", 0.16)), 0.16)
+    config["ui_tick_interval_ms"] = max(int(config.get("ui_tick_interval_ms", 50)), 50)
     config["motion_analysis_interval_seconds"] = max(
-        float(config.get("motion_analysis_interval_seconds", 0.06)),
-        0.06,
+        float(config.get("motion_analysis_interval_seconds", 0.10)),
+        0.10,
     )
     return config
 
@@ -929,6 +946,8 @@ class CameraReader(threading.Thread):
         stop_event,
         restart_event,
         max_width,
+        frame_interval_seconds,
+        grab_interval_seconds,
         open_timeout_ms,
         read_timeout_ms,
         stream_stall_seconds,
@@ -939,6 +958,8 @@ class CameraReader(threading.Thread):
         self.stop_event = stop_event
         self.restart_event = restart_event
         self.max_width = max_width
+        self.frame_interval_seconds = frame_interval_seconds
+        self.grab_interval_seconds = grab_interval_seconds
         self.open_timeout_ms = open_timeout_ms
         self.read_timeout_ms = read_timeout_ms
         self.stream_stall_seconds = stream_stall_seconds
@@ -1004,13 +1025,34 @@ class CameraReader(threading.Thread):
             time.sleep(0.5)
 
     def _capture_loop(self, cap, read_queue, session_stop):
+        next_emit_at = 0.0
+        next_grab_at = 0.0
         while not self.stop_event.is_set() and not session_stop.is_set():
-            ok, frame = cap.read()
+            now = time.time()
+            if now < next_grab_at:
+                time.sleep(min(0.01, next_grab_at - now))
+                continue
+
+            ok = cap.grab()
+            now = time.time()
+            next_grab_at = now + self.grab_interval_seconds
+            if session_stop.is_set():
+                break
+            if not ok:
+                self._put_latest_to(read_queue, ("error", None))
+                break
+
+            if now < next_emit_at:
+                continue
+
+            ok, frame = cap.retrieve()
             if session_stop.is_set():
                 break
             if not ok or frame is None:
                 self._put_latest_to(read_queue, ("error", None))
                 break
+
+            next_emit_at = time.time() + self.frame_interval_seconds
             self._put_latest_to(read_queue, ("frame", frame))
 
     def _port_is_reachable(self):
@@ -1290,6 +1332,8 @@ class PlateReaderApp:
             self.stop_event,
             self.camera_restart_event,
             int(self.config["max_frame_width"]),
+            float(self.config.get("camera_frame_interval_seconds", 0.10)),
+            float(self.config.get("camera_grab_interval_seconds", 0.03)),
             int(self.config["open_timeout_ms"]),
             int(self.config["read_timeout_ms"]),
             float(self.config.get("stream_stall_seconds", 2.0)),
@@ -1407,7 +1451,7 @@ class PlateReaderApp:
             except Exception:
                 pass
         finally:
-            self.root.after(33, self._tick)
+            self.root.after(int(self.config.get("ui_tick_interval_ms", 50)), self._tick)
 
     def _drain_events(self):
         while True:
