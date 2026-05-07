@@ -26,6 +26,8 @@ APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
 CONFIG_PATH = APP_DIR / "camera_config.json"
 DB_PATH = APP_DIR / "patentes_rut.sqlite3"
 CLIPBOARD_GUARD_PATH = APP_DIR / "clipboard_guard.json"
+ACCESS_ALLOWED_SOUND_PATH = APP_DIR / "ACCESO PERMITIDO.mp3"
+ACCESS_DENIED_SOUND_PATH = APP_DIR / "ACCESO DENEGADO.mp3"
 ERROR_ALREADY_EXISTS = 183
 _SINGLE_INSTANCE_MUTEX = None
 
@@ -61,7 +63,7 @@ DEFAULT_CONFIG = {
     "copy_provisional_plate_to_clipboard": True,
     "recopy_clipboard_interval_seconds": 0.45,
     "clear_clipboard_on_vehicle_start": True,
-    "access_overlay_seconds": 2.5,
+    "access_overlay_seconds": 4.0,
     "denied_message": "PATENTE EN LISTA DENEGADA",
     "max_frame_width": 1280,
     "open_timeout_ms": 5000,
@@ -152,6 +154,7 @@ def load_config():
         0.2,
     )
     config["known_plate_refresh_seconds"] = min(float(config.get("known_plate_refresh_seconds", 2.0)), 0.5)
+    config["access_overlay_seconds"] = 4.0
     return config
 
 
@@ -1737,7 +1740,30 @@ class PlateReaderApp:
         return True
 
     def _play_access_sound(self, allowed):
+        def play_mp3(path):
+            if not path.exists():
+                return False
+            alias = f"alerta_acceso_{time.time_ns()}"
+            winmm = ctypes.windll.winmm
+            winmm.mciSendStringW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_void_p]
+            winmm.mciSendStringW.restype = ctypes.c_uint
+            commands = (
+                f'open "{path}" type mpegvideo alias {alias}',
+                f"play {alias} from 0",
+            )
+            for command in commands:
+                if winmm.mciSendStringW(command, None, 0, None) != 0:
+                    winmm.mciSendStringW(f"close {alias}", None, 0, None)
+                    return False
+            time.sleep(6)
+            winmm.mciSendStringW(f"close {alias}", None, 0, None)
+            return True
+
         def play():
+            sound_path = ACCESS_ALLOWED_SOUND_PATH if allowed else ACCESS_DENIED_SOUND_PATH
+            if play_mp3(sound_path):
+                return
+
             beep_type = winsound.MB_ICONASTERISK if allowed else winsound.MB_ICONHAND
             alias = "SystemAsterisk" if allowed else "SystemHand"
             try:
@@ -1801,7 +1827,7 @@ class PlateReaderApp:
         title = "LA PATENTE REGISTRADA\nY DAR ACCESO" if allowed else "ACCESO DENEGADO"
         detail = f"PATENTE: {normalize_db_plate(plate)}"
         message = (message or ("ACCESO AUTORIZADO" if allowed else self.config.get("denied_message", ""))).strip().upper()
-        seconds = max(2.5, float(self.config.get("access_overlay_seconds", 2.5)))
+        seconds = 4.0
         x, y, screen_w, screen_h = self._primary_screen_geometry()
         title_font = max(44, min(92, int(screen_h * 0.085)))
         detail_font = max(34, min(68, int(screen_h * 0.060)))
