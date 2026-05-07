@@ -34,9 +34,9 @@ DEFAULT_CONFIG = {
     "roi": [0.0, 0.0, 1.0, 1.0],
     "plate_polygon": [],
     "vehicle_roi": [0.0, 0.0, 1.0, 1.0],
-    "ocr_interval_seconds": 0.12,
+    "ocr_interval_seconds": 0.08,
     "idle_scan_enabled": True,
-    "idle_ocr_interval_seconds": 0.6,
+    "idle_ocr_interval_seconds": 0.25,
     "always_scan": False,
     "auto_read_on_vehicle": True,
     "motion_enabled": True,
@@ -45,12 +45,12 @@ DEFAULT_CONFIG = {
     "reading_timeout_seconds": 5.0,
     "confirmed_cooldown_seconds": 1.0,
     "restart_read_on_motion_after_confirm_seconds": 0.8,
-    "recent_read_seconds": 2.0,
+    "recent_read_seconds": 1.2,
     "min_confirm_votes": 2,
     "min_vote_margin": 1,
-    "min_ocr_score": 0.80,
+    "min_ocr_score": 0.70,
     "fast_single_read_score": 0.93,
-    "known_plate_single_read_score": 0.80,
+    "known_plate_single_read_score": 0.72,
     "max_candidates_per_frame": 2,
     "ocr_preprocess_variants": 1,
     "ocr_target_width": 760,
@@ -58,6 +58,7 @@ DEFAULT_CONFIG = {
     "require_plate_in_database": False,
     "copy_confirmed_plate_to_clipboard": True,
     "copy_provisional_plate_to_clipboard": True,
+    "recopy_clipboard_interval_seconds": 0.45,
     "clear_clipboard_on_vehicle_start": True,
     "access_overlay_seconds": 2.5,
     "denied_message": "PATENTE EN LISTA DENEGADA",
@@ -110,6 +111,9 @@ CONFUSION_GROUPS = (
     set("6G"),
     set("7T"),
 )
+
+KNOWN_PLATE_FUZZY_MAX_DISTANCE = 1.05
+KNOWN_PLATE_FUZZY_SECOND_GAP = 0.35
 
 
 @dataclass
@@ -178,8 +182,9 @@ def correct_to_known_plate(candidate, score, known_plates):
 
     best_distance, best_plate = ranked[0]
     second_distance = ranked[1][0] if len(ranked) > 1 else float("inf")
-    if best_distance <= 0.85 and second_distance - best_distance >= 0.25:
-        return best_plate, min(0.99, score + 0.04)
+    if best_distance <= KNOWN_PLATE_FUZZY_MAX_DISTANCE and second_distance - best_distance >= KNOWN_PLATE_FUZZY_SECOND_GAP:
+        bonus = 0.08 if best_distance <= 0.85 else 0.05
+        return best_plate, min(0.99, score + bonus)
     return candidate, score
 
 
@@ -861,6 +866,8 @@ class PlateReaderApp:
         self.confirmed_plate = ""
         self.confirmed_rut = ""
         self.provisional_plate = ""
+        self.last_clipboard_plate = ""
+        self.last_clipboard_at = 0
         self.access_overlay = None
         self.known_plates = set()
         self.known_plates_loaded_at = 0
@@ -1078,6 +1085,8 @@ class PlateReaderApp:
         self.confirmed_plate = ""
         self.confirmed_rut = ""
         self.provisional_plate = ""
+        self.last_clipboard_plate = ""
+        self.last_clipboard_at = 0
         self.vehicle_active = False
         self.cooldown_until = 0
         self.confirmed_at = 0
@@ -1449,10 +1458,10 @@ class PlateReaderApp:
         if not self.vehicle_active and not self.config["always_scan"]:
             self.plate_value.configure(text=best)
             score = float(best_stats["max_score"])
-            if self.config.get("copy_provisional_plate_to_clipboard", True) and best != self.provisional_plate:
+            if self.config.get("copy_provisional_plate_to_clipboard", True):
                 self.provisional_plate = best
-                self._copy_to_clipboard(best)
-                self.status_value.configure(text=f"Prelectura copiada al portapapeles: {best}")
+                if self._copy_plate_to_clipboard(best):
+                    self.status_value.configure(text=f"Prelectura copiada al portapapeles: {best}")
             self.rut_value.configure(text=f"Preleyendo... {score:0.2f}")
             return
         if fast_single_ok or votes_ok:
@@ -1473,7 +1482,7 @@ class PlateReaderApp:
             self.plate_value.configure(text=best)
             self.rut_value.configure(text=self.confirmed_rut)
             if self.config["copy_confirmed_plate_to_clipboard"]:
-                self._copy_to_clipboard(best)
+                self._copy_plate_to_clipboard(best, force=True)
                 self.status_value.configure(text=f"Patente confirmada y copiada al portapapeles: {best}")
             else:
                 self.status_value.configure(text=f"Patente confirmada automaticamente: {best}")
@@ -1497,16 +1506,33 @@ class PlateReaderApp:
         elif not self.confirmed_plate:
             self.plate_value.configure(text=best)
             score = float(best_stats["max_score"])
-            if self.config.get("copy_provisional_plate_to_clipboard", True) and best != self.provisional_plate:
+            if self.config.get("copy_provisional_plate_to_clipboard", True):
                 self.provisional_plate = best
-                self._copy_to_clipboard(best)
-                self.status_value.configure(text=f"Patente provisional copiada al portapapeles: {best}")
+                if self._copy_plate_to_clipboard(best):
+                    self.status_value.configure(text=f"Patente provisional copiada al portapapeles: {best}")
             self.rut_value.configure(text=f"Leyendo... {votes}/{self.config['min_confirm_votes']} ({score:0.2f})")
 
     def _copy_to_clipboard(self, text):
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.root.update()
+        if text:
+            self.last_clipboard_plate = text
+            self.last_clipboard_at = time.time()
+        else:
+            self.last_clipboard_plate = ""
+            self.last_clipboard_at = 0
+
+    def _copy_plate_to_clipboard(self, plate, force=False):
+        plate = normalize_db_plate(plate)
+        if not plate:
+            return False
+        now = time.time()
+        interval = float(self.config.get("recopy_clipboard_interval_seconds", 0.45))
+        if not force and plate == self.last_clipboard_plate and now - self.last_clipboard_at < interval:
+            return False
+        self._copy_to_clipboard(plate)
+        return True
 
     def _play_access_sound(self, allowed):
         def play():
@@ -1758,6 +1784,11 @@ def run_self_test():
     corrected, corrected_score = correct_to_known_plate("ABCD1Z", 0.80, {"ABCD12"})
     assert corrected == "ABCD12"
     assert corrected_score > 0.80
+    fuzzy_corrected, fuzzy_score = correct_to_known_plate("ABCD13", 0.72, {"ABCD12"})
+    assert fuzzy_corrected == "ABCD12"
+    assert fuzzy_score > 0.72
+    ambiguous_corrected, _ambiguous_score = correct_to_known_plate("ABCD13", 0.72, {"ABCD12", "ABCD14"})
+    assert ambiguous_corrected == "ABCD13"
 
     image = np.full((140, 420, 3), 255, dtype=np.uint8)
     cv2.rectangle(image, (15, 20), (405, 120), (20, 20, 20), 3)
