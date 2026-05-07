@@ -46,11 +46,11 @@ DEFAULT_CONFIG = {
     "confirmed_cooldown_seconds": 1.0,
     "restart_read_on_motion_after_confirm_seconds": 0.8,
     "recent_read_seconds": 1.2,
-    "min_confirm_votes": 2,
-    "min_vote_margin": 1,
+    "min_confirm_votes": 1,
+    "min_vote_margin": 0,
     "min_ocr_score": 0.70,
-    "fast_single_read_score": 0.93,
-    "known_plate_single_read_score": 0.72,
+    "fast_single_read_score": 0.70,
+    "known_plate_single_read_score": 0.70,
     "max_candidates_per_frame": 2,
     "ocr_preprocess_variants": 1,
     "ocr_target_width": 760,
@@ -135,6 +135,14 @@ def load_config():
 
     config = dict(DEFAULT_CONFIG)
     config.update(data)
+    min_score = float(config.get("min_ocr_score", DEFAULT_CONFIG["min_ocr_score"]))
+    config["min_confirm_votes"] = 1
+    config["min_vote_margin"] = 0
+    config["fast_single_read_score"] = min(float(config.get("fast_single_read_score", min_score)), min_score)
+    config["known_plate_single_read_score"] = min(
+        float(config.get("known_plate_single_read_score", min_score)),
+        min_score,
+    )
     return config
 
 
@@ -1493,24 +1501,11 @@ class PlateReaderApp:
             reverse=True,
         )
         best, best_stats = ranked[0]
-        second_stats = ranked[1][1] if len(ranked) > 1 else {"votes": 0, "score_sum": 0.0, "max_score": 0.0}
         votes = int(best_stats["votes"])
-        second_votes = int(second_stats["votes"])
-        vote_margin = votes - second_votes
-        best_score_margin = float(best_stats["score_sum"]) - float(second_stats["score_sum"])
         rule_record = get_rule_record_for_plate(best)
-        best_is_known = bool(rule_record) or self._is_known_plate(best)
-        fast_threshold = (
-            float(self.config.get("known_plate_single_read_score", 0.80))
-            if best_is_known
-            else float(self.config.get("fast_single_read_score", 0.93))
-        )
-        fast_single_ok = (
-            float(best_stats["max_score"]) >= fast_threshold
-            and (second_votes == 0 or best_score_margin >= 0.08)
-        )
-        votes_ok = votes >= int(self.config["min_confirm_votes"]) and vote_margin >= int(self.config["min_vote_margin"])
-        if self.confirmed_plate == best:
+        output_plate = rule_record[0] if rule_record else best
+        single_read_ok = votes >= 1 and float(best_stats["max_score"]) >= float(self.config["min_ocr_score"])
+        if self.confirmed_plate == output_plate:
             return
         if not self.vehicle_active and not self.config["always_scan"]:
             self.plate_value.configure(text=best)
@@ -1521,9 +1516,8 @@ class PlateReaderApp:
                     self.status_value.configure(text=f"Prelectura copiada al portapapeles: {best}")
             self.rut_value.configure(text=f"Preleyendo... {score:0.2f}")
             return
-        if fast_single_ok or votes_ok:
+        if single_read_ok:
             now = time.time()
-            output_plate = rule_record[0] if rule_record else best
             rut = get_rut_for_plate(output_plate)
             if self.config["require_plate_in_database"] and not rut and not rule_record:
                 self.status_value.configure(text=f"{output_plate} leida, pero no esta en la tabla. No se copia.")
@@ -1549,8 +1543,6 @@ class PlateReaderApp:
                 self._show_access_overlay(output_plate, allowed, rule_message)
             else:
                 self.status_value.configure(text=f"Patente copiada sin regla de acceso/denegado: {output_plate}")
-        elif votes >= int(self.config["min_confirm_votes"]) and vote_margin < int(self.config["min_vote_margin"]):
-            self.status_value.configure(text=f"Lectura ambigua: {best} compite con otra patente. No se copia.")
         elif not self.confirmed_plate:
             self.plate_value.configure(text=best)
             score = float(best_stats["max_score"])
@@ -1558,7 +1550,7 @@ class PlateReaderApp:
                 self.provisional_plate = best
                 if self._copy_plate_to_clipboard(best):
                     self.status_value.configure(text=f"Patente provisional copiada al portapapeles: {best}")
-            self.rut_value.configure(text=f"Leyendo... {votes}/{self.config['min_confirm_votes']} ({score:0.2f})")
+            self.rut_value.configure(text=f"Leyendo... 1/1 ({score:0.2f})")
 
     def _copy_to_clipboard(self, text):
         self.root.clipboard_clear()
@@ -1608,13 +1600,13 @@ class PlateReaderApp:
 
         threading.Thread(target=play, daemon=True).start()
 
-    def _virtual_screen_geometry(self):
+    def _primary_screen_geometry(self):
         try:
             user32 = ctypes.windll.user32
-            x = int(user32.GetSystemMetrics(76))
-            y = int(user32.GetSystemMetrics(77))
-            width = int(user32.GetSystemMetrics(78))
-            height = int(user32.GetSystemMetrics(79))
+            x = 0
+            y = 0
+            width = int(user32.GetSystemMetrics(0))
+            height = int(user32.GetSystemMetrics(1))
             if width > 0 and height > 0:
                 return x, y, width, height
         except Exception:
@@ -1648,7 +1640,7 @@ class PlateReaderApp:
         detail = f"PATENTE: {normalize_db_plate(plate)}"
         message = (message or ("ACCESO AUTORIZADO" if allowed else self.config.get("denied_message", ""))).strip().upper()
         seconds = max(2.5, float(self.config.get("access_overlay_seconds", 2.5)))
-        x, y, screen_w, screen_h = self._virtual_screen_geometry()
+        x, y, screen_w, screen_h = self._primary_screen_geometry()
         title_font = max(44, min(92, int(screen_h * 0.085)))
         detail_font = max(34, min(68, int(screen_h * 0.060)))
         message_font = max(24, min(46, int(screen_h * 0.042)))
