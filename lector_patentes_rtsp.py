@@ -188,6 +188,29 @@ def correct_to_known_plate(candidate, score, known_plates):
     return candidate, score
 
 
+def find_fuzzy_plate_match(candidate, rows):
+    candidate = normalize_db_plate(candidate)
+    ranked = []
+    for plate, message in rows:
+        plate = normalize_db_plate(plate)
+        if len(plate) != len(candidate):
+            continue
+        ranked.append((known_plate_distance(candidate, plate), plate, message or ""))
+
+    if not ranked:
+        return None
+
+    ranked.sort(key=lambda item: item[0])
+    best_distance, best_plate, best_message = ranked[0]
+    second_distance = ranked[1][0] if len(ranked) > 1 else float("inf")
+    if (
+        best_distance <= KNOWN_PLATE_FUZZY_MAX_DISTANCE
+        and second_distance - best_distance >= KNOWN_PLATE_FUZZY_SECOND_GAP
+    ):
+        return best_plate, best_message
+    return None
+
+
 def positional_plate_variants(value):
     value = normalize_plate_text(value)
     if len(value) != 6:
@@ -413,6 +436,39 @@ def get_access_record(plate):
     ).fetchone()
     conn.close()
     return row
+
+
+def get_rule_record_for_plate(plate):
+    plate = normalize_db_plate(plate)
+
+    access_record = get_access_record(plate)
+    if access_record:
+        stored_plate, message = access_record
+        return normalize_db_plate(stored_plate), True, message or ""
+
+    denied_record = get_denied_record(plate)
+    if denied_record:
+        stored_plate, message = denied_record
+        return normalize_db_plate(stored_plate), False, message or ""
+
+    access_match = find_fuzzy_plate_match(plate, list_access_plates())
+    denied_match = find_fuzzy_plate_match(plate, list_denied_plates())
+    matches = []
+    if access_match:
+        matched_plate, message = access_match
+        matches.append((known_plate_distance(plate, matched_plate), matched_plate, True, message))
+    if denied_match:
+        matched_plate, message = denied_match
+        matches.append((known_plate_distance(plate, matched_plate), matched_plate, False, message))
+
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0])
+    if len(matches) > 1 and abs(matches[0][0] - matches[1][0]) < KNOWN_PLATE_FUZZY_SECOND_GAP:
+        return None
+
+    _distance, matched_plate, allowed, message = matches[0]
+    return matched_plate, allowed, message or ""
 
 
 def enforce_single_instance(name):
@@ -1442,7 +1498,8 @@ class PlateReaderApp:
         second_votes = int(second_stats["votes"])
         vote_margin = votes - second_votes
         best_score_margin = float(best_stats["score_sum"]) - float(second_stats["score_sum"])
-        best_is_known = self._is_known_plate(best)
+        rule_record = get_rule_record_for_plate(best)
+        best_is_known = bool(rule_record) or self._is_known_plate(best)
         fast_threshold = (
             float(self.config.get("known_plate_single_read_score", 0.80))
             if best_is_known
@@ -1466,41 +1523,32 @@ class PlateReaderApp:
             return
         if fast_single_ok or votes_ok:
             now = time.time()
-            rut = get_rut_for_plate(best)
-            if self.config["require_plate_in_database"] and not rut:
-                self.status_value.configure(text=f"{best} leida, pero no esta en la tabla. No se copia.")
-                self.plate_value.configure(text=best)
+            output_plate = rule_record[0] if rule_record else best
+            rut = get_rut_for_plate(output_plate)
+            if self.config["require_plate_in_database"] and not rut and not rule_record:
+                self.status_value.configure(text=f"{output_plate} leida, pero no esta en la tabla. No se copia.")
+                self.plate_value.configure(text=output_plate)
                 self.rut_value.configure(text="No esta en BD")
                 return
 
-            self.confirmed_plate = best
-            self.provisional_plate = best
+            self.confirmed_plate = output_plate
+            self.provisional_plate = output_plate
             self.confirmed_at = now
             self.vehicle_active = False
             self.cooldown_until = now + float(self.config["confirmed_cooldown_seconds"])
             self.confirmed_rut = f"RUT: {rut}" if rut else "Sin RUT asociado"
-            self.plate_value.configure(text=best)
+            self.plate_value.configure(text=output_plate)
             self.rut_value.configure(text=self.confirmed_rut)
             if self.config["copy_confirmed_plate_to_clipboard"]:
-                self._copy_plate_to_clipboard(best, force=True)
-                self.status_value.configure(text=f"Patente confirmada y copiada al portapapeles: {best}")
+                self._copy_plate_to_clipboard(output_plate, force=True)
+                self.status_value.configure(text=f"Patente confirmada y copiada al portapapeles: {output_plate}")
             else:
-                self.status_value.configure(text=f"Patente confirmada automaticamente: {best}")
-            access_record = get_access_record(best)
-            if access_record:
-                _stored_plate, access_message = access_record
-                self._show_access_overlay(best, True, access_message)
+                self.status_value.configure(text=f"Patente confirmada automaticamente: {output_plate}")
+            if rule_record:
+                _stored_plate, allowed, rule_message = rule_record
+                self._show_access_overlay(output_plate, allowed, rule_message)
             else:
-                denied_record = get_denied_record(best)
-                if denied_record:
-                    _stored_plate, denied_message = denied_record
-                    self._show_access_overlay(
-                        best,
-                        False,
-                        denied_message or self.config.get("denied_message", ""),
-                    )
-                else:
-                    self.status_value.configure(text=f"Patente copiada sin regla de acceso/denegado: {best}")
+                self.status_value.configure(text=f"Patente copiada sin regla de acceso/denegado: {output_plate}")
         elif votes >= int(self.config["min_confirm_votes"]) and vote_margin < int(self.config["min_vote_margin"]):
             self.status_value.configure(text=f"Lectura ambigua: {best} compite con otra patente. No se copia.")
         elif not self.confirmed_plate:
@@ -1536,22 +1584,56 @@ class PlateReaderApp:
 
     def _play_access_sound(self, allowed):
         def play():
+            beep_type = winsound.MB_ICONASTERISK if allowed else winsound.MB_ICONHAND
+            alias = "SystemAsterisk" if allowed else "SystemHand"
+            try:
+                winsound.MessageBeep(beep_type)
+            except Exception:
+                pass
             try:
                 if allowed:
-                    winsound.Beep(1200, 180)
-                    time.sleep(0.05)
-                    winsound.Beep(1500, 180)
+                    winsound.Beep(1400, 220)
+                    time.sleep(0.04)
+                    winsound.Beep(1750, 220)
                 else:
-                    winsound.Beep(520, 260)
-                    time.sleep(0.05)
-                    winsound.Beep(420, 260)
+                    winsound.Beep(520, 320)
+                    time.sleep(0.04)
+                    winsound.Beep(380, 320)
             except Exception:
-                try:
-                    winsound.MessageBeep(winsound.MB_ICONASTERISK if allowed else winsound.MB_ICONHAND)
-                except Exception:
-                    pass
+                pass
+            try:
+                winsound.PlaySound(alias, winsound.SND_ALIAS | winsound.SND_ASYNC)
+            except Exception:
+                pass
 
         threading.Thread(target=play, daemon=True).start()
+
+    def _virtual_screen_geometry(self):
+        try:
+            user32 = ctypes.windll.user32
+            x = int(user32.GetSystemMetrics(76))
+            y = int(user32.GetSystemMetrics(77))
+            width = int(user32.GetSystemMetrics(78))
+            height = int(user32.GetSystemMetrics(79))
+            if width > 0 and height > 0:
+                return x, y, width, height
+        except Exception:
+            pass
+        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+    def _force_overlay_topmost(self, overlay, x, y, width, height):
+        try:
+            overlay.geometry(f"{width}x{height}+{x}+{y}")
+            overlay.attributes("-topmost", True)
+            overlay.lift()
+            overlay.focus_force()
+            overlay.update_idletasks()
+            hwnd = overlay.winfo_id()
+            ctypes.windll.user32.ShowWindow(hwnd, 5)
+            ctypes.windll.user32.SetWindowPos(hwnd, -1, x, y, width, height, 0x0040)
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
 
     def _show_access_overlay(self, plate, allowed, message=""):
         if self.access_overlay is not None:
@@ -1564,57 +1646,58 @@ class PlateReaderApp:
         bg = "#16a34a" if allowed else "#b91c1c"
         title = "LA PATENTE REGISTRADA\nY DAR ACCESO" if allowed else "ACCESO DENEGADO"
         detail = f"PATENTE: {normalize_db_plate(plate)}"
-        message = (message or "").strip().upper()
+        message = (message or ("ACCESO AUTORIZADO" if allowed else self.config.get("denied_message", ""))).strip().upper()
         seconds = max(2.5, float(self.config.get("access_overlay_seconds", 2.5)))
+        x, y, screen_w, screen_h = self._virtual_screen_geometry()
+        title_font = max(44, min(92, int(screen_h * 0.085)))
+        detail_font = max(34, min(68, int(screen_h * 0.060)))
+        message_font = max(24, min(46, int(screen_h * 0.042)))
 
         overlay = tk.Toplevel(self.root)
         self.access_overlay = overlay
         overlay.configure(bg=bg)
         overlay.overrideredirect(True)
-        overlay.attributes("-fullscreen", True)
         overlay.attributes("-topmost", True)
-        overlay.lift()
-        overlay.focus_force()
+        overlay.geometry(f"{screen_w}x{screen_h}+{x}+{y}")
         overlay.bind("<Escape>", lambda _event: close_overlay())
+        self._force_overlay_topmost(overlay, x, y, screen_w, screen_h)
 
         content = tk.Frame(overlay, bg=bg)
-        content.place(relx=0.5, rely=0.5, anchor="center")
+        content.pack(fill="both", expand=True)
+        center = tk.Frame(content, bg=bg)
+        center.place(relx=0.5, rely=0.5, anchor="center")
 
         tk.Label(
-            content,
+            center,
             text=title,
             bg=bg,
             fg="white",
-            font=("Segoe UI", 68, "bold"),
+            font=("Segoe UI", title_font, "bold"),
             justify="center",
-        ).pack(padx=36, pady=(0, 24))
+        ).pack(padx=60, pady=(0, 28))
         tk.Label(
-            content,
+            center,
             text=detail,
             bg=bg,
             fg="white",
-            font=("Segoe UI", 46, "bold"),
+            font=("Segoe UI", detail_font, "bold"),
             justify="center",
-        ).pack(padx=36, pady=(0, 18))
+        ).pack(padx=60, pady=(0, 24))
         if message:
             tk.Label(
-                content,
+                center,
                 text=message,
                 bg=bg,
                 fg="white",
-                font=("Segoe UI", 30, "bold"),
+                font=("Segoe UI", message_font, "bold"),
                 justify="center",
-                wraplength=1100,
-            ).pack(padx=36)
+                wraplength=max(700, int(screen_w * 0.85)),
+            ).pack(padx=60)
 
         def keep_on_top():
             if self.access_overlay is overlay:
-                try:
-                    overlay.attributes("-topmost", True)
-                    overlay.lift()
-                except tk.TclError:
-                    return
-                overlay.after(250, keep_on_top)
+                self._force_overlay_topmost(overlay, x, y, screen_w, screen_h)
+                overlay.after(120, keep_on_top)
 
         def close_overlay():
             if self.access_overlay is overlay:
@@ -1789,6 +1872,8 @@ def run_self_test():
     assert fuzzy_score > 0.72
     ambiguous_corrected, _ambiguous_score = correct_to_known_plate("ABCD13", 0.72, {"ABCD12", "ABCD14"})
     assert ambiguous_corrected == "ABCD13"
+    assert find_fuzzy_plate_match("ABCD13", [("ABCD12", "permitido")]) == ("ABCD12", "permitido")
+    assert find_fuzzy_plate_match("ABCD13", [("ABCD12", ""), ("ABCD14", "")]) is None
 
     image = np.full((140, 420, 3), 255, dtype=np.uint8)
     cv2.rectangle(image, (15, 20), (405, 120), (20, 20, 20), 3)
