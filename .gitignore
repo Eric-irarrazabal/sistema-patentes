@@ -2,6 +2,7 @@ __pycache__/
 build/
 dist/
 *.spec
+*.log
 patentes_rut.sqlite3
 config.json
 camera_config.json

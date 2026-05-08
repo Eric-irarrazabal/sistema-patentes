@@ -1,5 +1,7 @@
 import json
 import ctypes
+import faulthandler
+import logging
 import queue
 import re
 import socket
@@ -10,6 +12,7 @@ import time
 import winsound
 from collections import deque
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
@@ -28,11 +31,48 @@ DB_PATH = APP_DIR / "patentes_rut.sqlite3"
 CLIPBOARD_GUARD_PATH = APP_DIR / "clipboard_guard.json"
 ACCESS_ALLOWED_SOUND_PATH = APP_DIR / "ACCESO PERMITIDO.mp3"
 ACCESS_DENIED_SOUND_PATH = APP_DIR / "ACCESO DENEGADO.mp3"
+LOG_PATH = APP_DIR / "lector_patentes_rtsp.log"
+FAULT_LOG_PATH = APP_DIR / "lector_patentes_rtsp_fault.log"
 ERROR_ALREADY_EXISTS = 183
 _SINGLE_INSTANCE_MUTEX = None
 _RULE_CACHE_AT = 0.0
 _RULE_ACCESS_ROWS = []
 _RULE_DENIED_ROWS = []
+_LOGGING_READY = False
+_FAULT_LOG_FILE = None
+
+
+def setup_logging():
+    global _LOGGING_READY, _FAULT_LOG_FILE
+    if _LOGGING_READY:
+        return
+    try:
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+        logger.handlers.clear()
+        handler = RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s"))
+        logger.addHandler(handler)
+
+        _FAULT_LOG_FILE = FAULT_LOG_PATH.open("a", encoding="utf-8")
+        faulthandler.enable(file=_FAULT_LOG_FILE, all_threads=True)
+
+        def log_unhandled_exception(exc_type, exc_value, exc_traceback):
+            logging.critical("Excepcion no controlada", exc_info=(exc_type, exc_value, exc_traceback))
+
+        def log_thread_exception(args):
+            logging.critical(
+                "Excepcion no controlada en hilo %s",
+                getattr(args.thread, "name", ""),
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+
+        sys.excepthook = log_unhandled_exception
+        threading.excepthook = log_thread_exception
+        _LOGGING_READY = True
+        logging.info("%s iniciado. frozen=%s app_dir=%s", APP_NAME, getattr(sys, "frozen", False), APP_DIR)
+    except Exception:
+        _LOGGING_READY = True
 
 
 DEFAULT_CONFIG = {
@@ -966,6 +1006,7 @@ class CameraReader(threading.Thread):
 
     def run(self):
         if not self.rtsp_url:
+            logging.error("Falta configurar rtsp_url")
             self.output_queue.put(("status", "Falta configurar rtsp_url"))
             return
 
@@ -978,8 +1019,10 @@ class CameraReader(threading.Thread):
         )
 
         while not self.stop_event.is_set():
+            logging.info("Conectando camara RTSP")
             self.output_queue.put(("status", "Conectando camara..."))
             if not self._port_is_reachable():
+                logging.warning("Camara no alcanzable en red/puerto RTSP")
                 self.output_queue.put(("status", "Camara no alcanzable en red/puerto RTSP. Reintentando..."))
                 time.sleep(2)
                 continue
@@ -991,11 +1034,13 @@ class CameraReader(threading.Thread):
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():
+                logging.warning("No se pudo abrir RTSP con OpenCV")
                 self.output_queue.put(("status", "No se pudo conectar. Reintentando..."))
                 cap.release()
                 time.sleep(2)
                 continue
 
+            logging.info("Camara conectada")
             self.output_queue.put(("status", "Camara conectada"))
             read_queue = queue.Queue(maxsize=1)
             session_stop = threading.Event()
@@ -1007,11 +1052,13 @@ class CameraReader(threading.Thread):
                     kind, payload = read_queue.get(timeout=0.1)
                 except queue.Empty:
                     if time.time() - last_frame_at >= self.stream_stall_seconds:
+                        logging.warning("Camara sin frames nuevos por %.1fs", self.stream_stall_seconds)
                         self.output_queue.put(("status", "Camara sin frames nuevos. Reconectando..."))
                         break
                     continue
 
                 if kind != "frame":
+                    logging.warning("Se perdio video desde capture loop")
                     self.output_queue.put(("status", "Se perdio video. Reintentando..."))
                     break
 
@@ -1446,6 +1493,7 @@ class PlateReaderApp:
             self._drain_events()
             self._render_frame()
         except Exception as exc:
+            logging.exception("Error recuperado en tick principal")
             try:
                 self.status_value.configure(text=f"Error recuperado en video: {exc}")
             except Exception:
@@ -1460,6 +1508,7 @@ class PlateReaderApp:
             except queue.Empty:
                 break
             if kind == "status":
+                logging.info("Estado UI: %s", payload)
                 self.status_value.configure(text=payload)
             elif kind == "frame":
                 self.latest_frame = payload
@@ -1483,6 +1532,7 @@ class PlateReaderApp:
             if self.same_frame_started_at == 0:
                 self.same_frame_started_at = now
             elif now - self.same_frame_started_at >= float(self.config.get("duplicate_frame_stall_seconds", 1.2)):
+                logging.warning("Camara congelada despues de movimiento. Solicitando reconexion")
                 self.status_value.configure(text="Camara congelada despues de movimiento. Reconectando...")
                 self.camera_restart_event.set()
                 self.last_frame_signature = None
@@ -1536,6 +1586,7 @@ class PlateReaderApp:
                     self._start_vehicle_read(now)
 
     def _start_vehicle_read(self, now):
+        logging.info("Vehiculo detectado. Iniciando lectura OCR")
         self.vehicle_active = True
         self.vehicle_started_at = now
         self.last_vehicle_detected_at = now
@@ -1626,6 +1677,7 @@ class PlateReaderApp:
                     self.frame_queue.put(("status", f"OCR: {', '.join(c.text for c in candidates[:3])}"))
                 self.frame_queue.put(("ocr_result", candidates))
             except Exception as exc:
+                logging.exception("Error OCR recuperado")
                 self.frame_queue.put(("status", f"Error OCR recuperado: {exc}"))
                 self.frame_queue.put(("ocr_result", []))
 
@@ -1739,6 +1791,7 @@ class PlateReaderApp:
             try:
                 results, _elapsed = self.ocr(image)
             except Exception as exc:
+                logging.exception("Error OCR")
                 self.frame_queue.put(("status", f"Error OCR: {exc}"))
                 return []
 
@@ -1823,6 +1876,12 @@ class PlateReaderApp:
             self.rut_value.configure(text="No esta en BD")
             return False
 
+        logging.info(
+            "Patente confirmada raw=%s output=%s regla=%s",
+            raw_plate,
+            output_plate,
+            "si" if rule_record else "no",
+        )
         self.confirmed_plate = output_plate
         self.provisional_plate = output_plate
         self.confirmed_at = now
@@ -1837,6 +1896,7 @@ class PlateReaderApp:
         self._record_plate_history_once(output_plate)
         if self.config["copy_confirmed_plate_to_clipboard"]:
             self._copy_plate_to_clipboard(output_plate, force=True)
+            logging.info("Patente copiada al portapapeles: %s", output_plate)
             self.status_value.configure(text=f"Patente confirmada y copiada al portapapeles: {output_plate}")
         else:
             self.status_value.configure(text=f"Patente confirmada automaticamente: {output_plate}")
@@ -1964,8 +2024,10 @@ class PlateReaderApp:
         def play():
             sound_path = ACCESS_ALLOWED_SOUND_PATH if allowed else ACCESS_DENIED_SOUND_PATH
             if play_mp3(sound_path):
+                logging.info("Audio de alerta reproducido: %s", sound_path.name)
                 return
 
+            logging.warning("No se pudo reproducir MP3 de alerta, usando sonido fallback: %s", sound_path)
             beep_type = winsound.MB_ICONASTERISK if allowed else winsound.MB_ICONHAND
             alias = "SystemAsterisk" if allowed else "SystemHand"
             try:
@@ -2018,6 +2080,7 @@ class PlateReaderApp:
             pass
 
     def _show_access_overlay(self, plate, allowed, message=""):
+        logging.info("Mostrando alerta %s para patente %s", "permitido" if allowed else "denegado", plate)
         if self.access_overlay is not None:
             try:
                 self.access_overlay.destroy()
@@ -2229,6 +2292,7 @@ class PlateReaderApp:
         )
 
     def close(self):
+        logging.info("Cerrando lector por solicitud de usuario")
         self.stop_event.set()
         self.root.destroy()
 
@@ -2239,12 +2303,18 @@ class PlateReaderApp:
 
 
 def main():
+    setup_logging()
     if "--self-test" in sys.argv:
         run_self_test()
         return
-    enforce_single_instance("Local\\LectorPatentesRTSP")
-    app = PlateReaderApp()
-    app.run()
+    try:
+        enforce_single_instance("Local\\LectorPatentesRTSP")
+        app = PlateReaderApp()
+        app.run()
+        logging.info("Lector finalizado normalmente")
+    except Exception:
+        logging.exception("Falla fatal del lector")
+        raise
 
 
 def run_self_test():
